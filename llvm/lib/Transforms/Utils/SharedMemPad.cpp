@@ -1,6 +1,8 @@
 #include "llvm/Transforms/Utils/SharedMemPad.h"
+#include "llvm/Transforms/Utils/BlockGridDimensionAnalysis.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Module.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/TargetParser/Triple.h"
 
@@ -13,6 +15,7 @@
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/Format.h"
 
 #include <cstdint>
 #include <map>
@@ -21,6 +24,17 @@
 
 using namespace llvm;
 #define DEBUG_TYPE "shared-mem-pad"
+
+// Command-line option pointing to the JSON file produced by Phase 1
+// (running -passes=cuda-blockdim-extract on the host IR).
+// If provided, blockDim is read from the JSON for accurate bank conflict
+// analysis. Without it, analysis is skipped for kernels with 2D/3D access.
+static cl::opt<std::string> BlockDimFile(
+    "cuda-blockdim-file",
+    cl::desc("JSON file with CUDA kernel block dimensions (produced by "
+             "running 'opt -passes=cuda-blockdim-extract' on host IR)"),
+    cl::value_desc("filename"),
+    cl::init(""));
 
 // target machine: NV GPU
 // 1. Calculate the access stride of shared memory between all the threads in
@@ -209,21 +223,6 @@ public:
 
 };
 
-// Extracts block dimensions from function attributes if available
-// Returns true if successful, false otherwise
-static bool getBlockDimFromFn(Function &F, int &BlockDimX, int &BlockDimY, int &BlockDimZ) {
-  if (F.hasFnAttribute("reqntidx")) {
-    StringRef Reqntidx = F.getFnAttribute("reqntidx").getValueAsString();
-    // Format is usually "X Y Z" or just a single integer
-    SmallVector<StringRef, 3> Dims;
-    Reqntidx.split(Dims, ' ');
-    if (Dims.size() >= 1) Dims[0].getAsInteger(10, BlockDimX);
-    if (Dims.size() >= 2) Dims[1].getAsInteger(10, BlockDimY);
-    if (Dims.size() >= 3) Dims[2].getAsInteger(10, BlockDimZ);
-    return true;
-  }
-  return false;
-}
 
 // Helper method to compute bank conflicts based on strides and block dimensions
 static int computeBankConflict(DimStrides S, int BlockDimX, int BlockDimY) {
@@ -253,6 +252,68 @@ static int computeBankConflict(DimStrides S, int BlockDimX, int BlockDimY) {
 }
 
 PreservedAnalyses SharedMemPass::run(Function &F, FunctionAnalysisManager &AM) {
+  // --- Load blockDim from JSON file if -cuda-blockdim-file was specified ---
+  // Priority: JSON file > reqntidx attr > heuristic fallback
+  int BlockDimX = 32, BlockDimY = 1, BlockDimZ = 1;
+  bool HasKnownBlockDim = false;
+
+  if (!BlockDimFile.empty()) {
+    auto ResultOrErr =
+        autotex::BlockGridDimensionAnalysisJSONImporter::fromFile(BlockDimFile);
+    if (!ResultOrErr) {
+      errs() << "[SharedMemPass] Warning: failed to load blockdim JSON: "
+             << toString(ResultOrErr.takeError()) << "\n";
+    } else {
+      // The JSON is keyed by the *stub* function name (host side).
+      // The device kernel name typically matches after stripping the
+      // __device_stub__ prefix added by clang.
+      StringRef DeviceName = F.getName();
+      auto &BGDs = *ResultOrErr;
+
+      // Strategy: try direct name match first.
+      auto It = BGDs.find(DeviceName.str());
+
+      // Strategy: suffix match.
+      // Device function mangling:  _Z<N><name><types>
+      // Stub function mangling:    _Z<M>__device_stub__<name><types>
+      // Both share the suffix "<name><types>" after stripping "_Z" + digits.
+      // Example:
+      //   device: _Z12lud_internalPfii  → suffix: lud_internalPfii
+      //   stub:   _Z22__device_stub__lud_internalPfii → ends_with that suffix
+      if (It == BGDs.end()) {
+        StringRef Suffix = DeviceName;
+        Suffix.consume_front("_Z");
+        while (!Suffix.empty() && isdigit(Suffix.front()))
+          Suffix = Suffix.drop_front();
+        if (!Suffix.empty()) {
+          for (auto &[StubName, BGD] : BGDs) {
+            if (StringRef(StubName).ends_with(Suffix)) {
+              It = BGDs.find(StubName);
+              errs() << "[SharedMemPass] Matched device '"
+                                << DeviceName << "' to stub '" << StubName
+                                << "' via suffix '" << Suffix << "'\n";
+              break;
+            }
+          }
+        }
+      }
+
+      if (It != BGDs.end()) {
+        auto &BD = It->second.BlockDim;
+        if (BD.X) BlockDimX = static_cast<int>(*BD.X);
+        if (BD.Y) BlockDimY = static_cast<int>(*BD.Y);
+        if (BD.Z) BlockDimZ = static_cast<int>(*BD.Z);
+        HasKnownBlockDim = true;
+        errs() << "[SharedMemPass] Loaded blockDim from JSON for '"
+                          << DeviceName << "': (" << BlockDimX << ", "
+                          << BlockDimY << ", " << BlockDimZ << ")\n";
+      } else {
+        errs() << "[SharedMemPass] No JSON entry found for '"
+                          << DeviceName << "'\n";
+      }
+    }
+  }
+
   // Get ScalarEvolution Analysis and BlockFrequency Analysis
   ScalarEvolution &SE = AM.getResult<ScalarEvolutionAnalysis>(F);
   BlockFrequencyInfo &BFI = AM.getResult<BlockFrequencyAnalysis>(F);
@@ -312,6 +373,9 @@ PreservedAnalyses SharedMemPass::run(Function &F, FunctionAnalysisManager &AM) {
         int ConflictCount = 32;
 
         if (TidValues.empty()) {
+          // If the function doesn't even use thread IDs,
+          // it might be broadcast (stride 0) or unanalyzable.
+          // Let's be safe and mark it unknown.
           Case = StrideCase::UNKNOWN_CASE;
         } else {
           Value *TidX = nullptr, *TidY = nullptr, *TidZ = nullptr;
@@ -325,12 +389,14 @@ PreservedAnalyses SharedMemPass::run(Function &F, FunctionAnalysisManager &AM) {
               TidZ = V;
           }
 
+          // Get the primitive size in bytes for the element being accessed
           Type *AccessType =
               IsLoad ? cast<LoadInst>(&I)->getType()
                      : cast<StoreInst>(&I)->getValueOperand()->getType();
           const DataLayout &DL = F.getParent()->getDataLayout();
           unsigned ElementSizeBytes = DL.getTypeStoreSize(AccessType);
 
+          // Use SCEV to calculate the stride
           const SCEV *Expr = SE.getSCEV(PtrOp);
           StrideVisitor Visitor(SE, TidX, TidY, TidZ);
           S = Visitor.visit(Expr);
@@ -343,32 +409,27 @@ PreservedAnalyses SharedMemPass::run(Function &F, FunctionAnalysisManager &AM) {
             S.Ty /= ElementSizeBytes;
             S.Tz /= ElementSizeBytes;
 
-            // Attempt to deduce block sizes from function attributes
-            // Many CUDA codes might have "reqntidx" if __launch_bounds__ is used
-            int BlockDimX = 32, BlockDimY = 1, BlockDimZ = 1;
-            bool HasStaticallyKnownBlockSize = getBlockDimFromFn(F, BlockDimX, BlockDimY, BlockDimZ);
-
-            // If not found, realistically the LLVM pass doesn't know the blockDim at compile time.
-            // Using a default of 32 for bank conflict estimation.
-            // If the user's BlockDimX < 32 (like 16), the bank conflict formula changes,
-            // but without metadata or explicit host-passed arguments, the pass cannot know.
-            if (!HasStaticallyKnownBlockSize && (S.Ty != 0 || S.Tz != 0)) {
-               // We will use 16 as a heuristic fallback if Ty/Tz are used just to show the difference
-               // But usually compiler passes require front-end attributes to be certain.
-               BlockDimX = 16;
-               errs() << "CHEAT" << "\n";
-            }
-
-            int MaxConflict = computeBankConflict(S, BlockDimX, BlockDimY);
-            ConflictCount = MaxConflict;
-            
-            if (S.Tx == 0 && S.Ty == 0 && S.Tz == 0) {
-              Case = StrideCase::BROADCAST;
-              ConflictCount = 0;
-            } else if (MaxConflict <= 1) {
-              Case = StrideCase::STRIDE_ODD; // No conflict
+            // Use blockDim from JSON (loaded at function start).
+            // If Ty/Tz are used but blockDim is unknown, we cannot determine
+            // how threads distribute across X and Y, so mark UNKNOWN.
+            if (!HasKnownBlockDim && (S.Ty != 0 || S.Tz != 0)) {
+              Case = StrideCase::UNKNOWN_CASE;
             } else {
-              Case = StrideCase::STRIDE_EVEN;
+              // For pure 1D access (only Tx), warp always fills X-dimension,
+              // so BlockDimX=32 is safe even when blockDim is not known.
+              int EffBlockDimX = HasKnownBlockDim ? BlockDimX : 32;
+              int MaxConflict = computeBankConflict(S, EffBlockDimX, BlockDimY);
+              ConflictCount = MaxConflict;
+
+              if (S.Tx == 0 && S.Ty == 0 && S.Tz == 0) {
+                Case = StrideCase::BROADCAST;
+                ConflictCount = 0;
+              } else if (MaxConflict <= 1) {
+                Case = StrideCase::STRIDE_ODD; // No conflict
+                ConflictCount = 0;
+              } else {
+                Case = StrideCase::STRIDE_EVEN;
+              }
             }
           }
         }
@@ -429,6 +490,97 @@ PreservedAnalyses SharedMemPass::run(Function &F, FunctionAnalysisManager &AM) {
       errs() << "  Store " << Pair.first.first
              << " (Case: " << Pair.first.second
              << ") - Estimated Accesses: " << Pair.second << "\n";
+    }
+
+    // -----------------------------------------------------------------------
+    // Optimal Padding L Calculation (Benefit Maximization)
+    //
+    // For each even-stride access (which has bank conflicts), the "ideal" pad
+    // period L that eliminates conflicts for that stride is:
+    //   L = lcm(S, 32)
+    //
+    // We group accesses by their ideal L, then pick the L with the highest:
+    //   Benefit(L) = Σ  Weight_i × ConflictCount_i    (for strides w/ idealL == L)
+    //
+    // Only applies when the variable has no UNKNOWN accesses.
+    // -----------------------------------------------------------------------
+    if (!Info.HasUnknownAccess) {
+      // Aggregate all accesses (loads + stores) into a single list of
+      // (DominantStride, ConflictCount, Weight) tuples.
+      struct StrideEntry {
+        int64_t Stride;     // Dominant stride in elements (Tx if != 0, else Ty)
+        int ConflictCount;
+        uint64_t Weight;
+      };
+      std::vector<StrideEntry> Entries;
+
+      auto CollectEntries = [&](const std::vector<AccessInfo> &Accesses) {
+        for (const auto &Acc : Accesses) {
+          // Use dominant stride (Tx first, then Ty)
+          int64_t S = Acc.Strides.Tx != 0 ? Acc.Strides.Tx : Acc.Strides.Ty;
+          Entries.push_back({S, Acc.ConflictCount, Acc.Weight});
+        }
+      };
+      CollectEntries(Info.Loads);
+      CollectEntries(Info.Stores);
+
+      // Compute total weight for normalization (for display only)
+      uint64_t TotalWeight = 0;
+      for (auto &E : Entries)
+        TotalWeight += E.Weight;
+
+      if (TotalWeight == 0) {
+        errs() << "  [Padding] No accesses found.\n";
+      } else {
+        // For each unique even stride > 1, compute its ideal L = lcm(S, 32).
+        // Collect candidate L values.
+        // gcd and lcm:
+        auto GCD = [](int64_t A, int64_t B) -> int64_t {
+          A = std::abs(A);
+          B = std::abs(B);
+          while (B) { A %= B; std::swap(A, B); }
+          return A;
+        };
+        auto LCM = [&GCD](int64_t A, int64_t B) -> int64_t {
+          if (A == 0 || B == 0) return 0;
+          return (A / GCD(A, B)) * B;
+        };
+
+        // Map: L -> Benefit(L)
+        std::map<int64_t, double> BenefitMap;
+
+        for (auto &E : Entries) {
+          // Only even strides > 1 have conflicts that need padding
+          if (E.Stride <= 1 || E.Stride % 2 != 0)
+            continue;
+
+          int64_t IdealL = LCM(E.Stride, 32);
+          if (IdealL <= 0)
+            continue;
+
+          // Proportion of total accesses this entry represents
+          double Proportion = (double)E.Weight / (double)TotalWeight;
+          BenefitMap[IdealL] += Proportion * E.ConflictCount;
+        }
+
+        if (BenefitMap.empty()) {
+          errs() << "  [Padding] No conflicting even strides found. No padding needed.\n";
+        } else {
+          // Find L with maximum benefit
+          int64_t BestL = 0;
+          double BestBenefit = 0.0;
+          for (auto &[L, Benefit] : BenefitMap) {
+            errs() << "  [Padding] Candidate L=" << L
+                   << " Benefit=" << format("%.4f", Benefit) << "\n";
+            if (Benefit > BestBenefit) {
+              BestBenefit = Benefit;
+              BestL = L;
+            }
+          }
+          errs() << "  [Padding] >>> Recommended pad period: L=" << BestL
+                 << " (Benefit=" << format("%.4f", BestBenefit) << ")\n";
+        }
+      }
     }
   }
 
