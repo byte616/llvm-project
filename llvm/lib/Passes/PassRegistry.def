@@ -29,6 +29,7 @@ MODULE_ANALYSIS("pass-instrumentation", PassInstrumentationAnalysis(PIC))
 MODULE_ANALYSIS("profile-summary", ProfileSummaryAnalysis())
 MODULE_ANALYSIS("stack-safety", StackSafetyGlobalAnalysis())
 MODULE_ANALYSIS("verify", VerifierAnalysis())
+MODULE_ANALYSIS("block-grid-dimension", autotex::BlockGridDimensionAnalysis())
 
 #ifndef MODULE_ALIAS_ANALYSIS
 #define MODULE_ALIAS_ANALYSIS(NAME, CREATE_PASS)                               \
@@ -59,7 +60,8 @@ MODULE_PASS("dot-callgraph", CallGraphDOTPrinterPass())
 MODULE_PASS("dxil-upgrade", DXILUpgradePass())
 MODULE_PASS("elim-avail-extern", EliminateAvailableExternallyPass())
 MODULE_PASS("extract-blocks", BlockExtractorPass({}, false))
-MODULE_PASS("expand-variadics", ExpandVariadicsPass(ExpandVariadicsMode::Disable))
+MODULE_PASS("expand-variadics",
+            ExpandVariadicsPass(ExpandVariadicsMode::Disable))
 MODULE_PASS("forceattrs", ForceFunctionAttrsPass())
 MODULE_PASS("function-import", FunctionImportPass())
 MODULE_PASS("globalopt", GlobalOptPass())
@@ -86,7 +88,10 @@ MODULE_PASS("lower-emutls", LowerEmuTLSPass())
 MODULE_PASS("lower-global-dtors", LowerGlobalDtorsPass())
 MODULE_PASS("lower-ifunc", LowerIFuncPass())
 MODULE_PASS("lowertypetests", LowerTypeTestsPass())
-MODULE_PASS("pgo-force-function-attrs", PGOForceFunctionAttrsPass(PGOOpt ? PGOOpt->ColdOptType : PGOOptions::ColdFuncOpt::Default))
+MODULE_PASS("pgo-force-function-attrs",
+            PGOForceFunctionAttrsPass(PGOOpt
+                                          ? PGOOpt->ColdOptType
+                                          : PGOOptions::ColdFuncOpt::Default))
 MODULE_PASS("memprof-context-disambiguation", MemProfContextDisambiguation())
 MODULE_PASS("memprof-module", ModuleMemProfilerPass())
 MODULE_PASS("mergefunc", MergeFunctionsPass())
@@ -144,6 +149,8 @@ MODULE_PASS("tsan-module", ModuleThreadSanitizerPass())
 MODULE_PASS("verify", VerifierPass())
 MODULE_PASS("view-callgraph", CallGraphViewerPass())
 MODULE_PASS("wholeprogramdevirt", WholeProgramDevirtPass())
+MODULE_PASS("cuda-blockdim-extract",
+            autotex::BlockGridDimensionAnalysisJSONExporter(llvm::errs()))
 #undef MODULE_PASS
 
 #ifndef MODULE_PASS_WITH_PARAMS
@@ -155,7 +162,7 @@ MODULE_PASS_WITH_PARAMS(
     parseASanPassOptions, "kernel")
 MODULE_PASS_WITH_PARAMS(
     "cg-profile", "CGProfilePass",
-    [](bool InLTOPostLink) { return CGProfilePass(InLTOPostLink);},
+    [](bool InLTOPostLink) { return CGProfilePass(InLTOPostLink); },
     parseCGProfilePassOptions, "in-lto-post-link")
 MODULE_PASS_WITH_PARAMS(
     "global-merge", "GlobalMergePass",
@@ -261,7 +268,8 @@ CGSCC_PASS_WITH_PARAMS(
 FUNCTION_ANALYSIS("aa", AAManager())
 FUNCTION_ANALYSIS("access-info", LoopAccessAnalysis())
 FUNCTION_ANALYSIS("assumptions", AssumptionAnalysis())
-FUNCTION_ANALYSIS("bb-sections-profile-reader", BasicBlockSectionsProfileReaderAnalysis(TM))
+FUNCTION_ANALYSIS("bb-sections-profile-reader",
+                  BasicBlockSectionsProfileReaderAnalysis(TM))
 FUNCTION_ANALYSIS("block-freq", BlockFrequencyAnalysis())
 FUNCTION_ANALYSIS("branch-prob", BranchProbabilityAnalysis())
 FUNCTION_ANALYSIS("cycles", CycleAnalysis())
@@ -480,6 +488,7 @@ FUNCTION_PASS("view-dom-only", DomOnlyViewer())
 FUNCTION_PASS("view-post-dom", PostDomViewer())
 FUNCTION_PASS("view-post-dom-only", PostDomOnlyViewer())
 FUNCTION_PASS("wasm-eh-prepare", WasmEHPreparePass())
+FUNCTION_PASS("shared-mem-pad", SharedMemPass())
 #undef FUNCTION_PASS
 
 #ifndef FUNCTION_PASS_WITH_PARAMS
@@ -609,7 +618,7 @@ LOOP_ANALYSIS("iv-users", IVUsersAnalysis())
 LOOP_ANALYSIS("no-op-loop", NoOpLoopAnalysis())
 LOOP_ANALYSIS("pass-instrumentation", PassInstrumentationAnalysis(PIC))
 LOOP_ANALYSIS("should-run-extra-simple-loop-unswitch",
-                  ShouldRunExtraSimpleLoopUnswitch())
+              ShouldRunExtraSimpleLoopUnswitch())
 
 #undef LOOP_ANALYSIS
 
