@@ -224,31 +224,70 @@ public:
 };
 
 
-// Helper method to compute bank conflicts based on strides and block dimensions
+// Helper: compute max bank conflict for one warp given strides and blockDim.
 static int computeBankConflict(DimStrides S, int BlockDimX, int BlockDimY) {
-  // If only Tx varies or block is essentially 1D for X, use X, else consider Ty
-  if (BlockDimX <= 0) BlockDimX = 32;
-
   int Banks[32] = {0};
   int MaxConflict = 0;
   std::set<int> Address;
   for (int T = 0; T < 32; ++T) {
     int ThreadX = T % BlockDimX;
-    int ThreadY = (T / BlockDimX);
-    // tz is 0 for the first 32 threads, ignore for now
-            
+    int ThreadY = T / BlockDimX;
     int64_t ElementIndex = ThreadX * S.Tx + ThreadY * S.Ty;
-    
-    if(!Address.count(ElementIndex)) {
+    if (!Address.count(ElementIndex)) {
       Address.insert(ElementIndex);
-      int Bank = ElementIndex % 32;
+      int Bank = std::abs((int)(ElementIndex % 32));
       Banks[Bank]++;
-      if (Banks[Bank] > MaxConflict) {
-        MaxConflict = Banks[Bank];
-      }
+      MaxConflict = std::max(MaxConflict, Banks[Bank]);
     }
   }
   return MaxConflict;
+}
+
+// Compute average bank conflict across one full cycle of warps for stride S
+// **with** padding period L applied.
+//
+// When we pad every L logical elements (insert 1 extra physical element), the
+// physical address of logical element i is:
+//   physical(i) = i + floor(i / L)
+//
+// We simulate lcm(32*|S|, L) / (32*|S|) warps -- the minimum number of warps
+// needed for the bank pattern to repeat -- and return the average per-warp
+// max-bank-conflict count.
+//
+// Returns a double so the caller can compare fractional averages.
+static double computeBankConflictWithPadding(DimStrides S, int BlockDimX,
+                                              int BlockDimY, int64_t PaddingL) {
+
+  // Dominant stride: prefer Tx, then Ty.
+  int64_t DomStride = (S.Tx != 0) ? std::abs(S.Tx) : std::abs(S.Ty);
+  if (DomStride == 0)
+    return 1.0; // broadcast -- always 1 (no conflict)
+
+  // Cycle length in warps: one full padding period covers S*L logical elements.
+  // Each warp covers 32*S elements, so: (S*L) / (32*S) = L/32.
+  int64_t CycleWarps = std::max((int64_t)1, PaddingL / 32);
+
+  double TotalConflict = 0.0;
+  for (int64_t W = 0; W < CycleWarps; ++W) {
+    int Banks[32] = {0};
+    int MaxConflict = 0;
+    std::set<int64_t> Seen;
+    for (int T = 0; T < 32; ++T) {
+      int ThreadX = T % BlockDimX;
+      int ThreadY = T / BlockDimX;
+      int64_t Logical = W * 32 * DomStride + ThreadX * S.Tx + ThreadY * S.Ty;
+      if (Seen.count(Logical))
+        continue;
+      Seen.insert(Logical);
+      int64_t LogAbs = std::abs(Logical);
+      int64_t Physical = LogAbs + LogAbs / PaddingL;
+      int Bank = (int)(Physical % 32);
+      Banks[Bank]++;
+      MaxConflict = std::max(MaxConflict, Banks[Bank]);
+    }
+    TotalConflict += MaxConflict;
+  }
+  return TotalConflict / (double)CycleWarps;
 }
 
 PreservedAnalyses SharedMemPass::run(Function &F, FunctionAnalysisManager &AM) {
@@ -423,10 +462,10 @@ PreservedAnalyses SharedMemPass::run(Function &F, FunctionAnalysisManager &AM) {
 
               if (S.Tx == 0 && S.Ty == 0 && S.Tz == 0) {
                 Case = StrideCase::BROADCAST;
-                ConflictCount = 0;
+                ConflictCount = 1;
               } else if (MaxConflict <= 1) {
                 Case = StrideCase::STRIDE_ODD; // No conflict
-                ConflictCount = 0;
+                ConflictCount = 1;
               } else {
                 Case = StrideCase::STRIDE_EVEN;
               }
@@ -493,38 +532,36 @@ PreservedAnalyses SharedMemPass::run(Function &F, FunctionAnalysisManager &AM) {
     }
 
     // -----------------------------------------------------------------------
-    // Optimal Padding L Calculation (Benefit Maximization)
+    // Optimal Padding L Selection (Full Cost Model)
     //
-    // For each even-stride access (which has bank conflicts), the "ideal" pad
-    // period L that eliminates conflicts for that stride is:
-    //   L = lcm(S, 32)
+    // For each candidate L = lcm(|S|, 32) (from even strides with conflict),
+    // compute the net score across ALL accesses:
     //
-    // We group accesses by their ideal L, then pick the L with the highest:
-    //   Benefit(L) = Σ  Weight_i × ConflictCount_i    (for strides w/ idealL == L)
+    //   score(L) = Σ_i  W_i/TotalW × (conflict_before_i - conflict_after_i(L))
     //
-    // Only applies when the variable has no UNKNOWN accesses.
+    // conflict_after is computed by simulating physical bank access with
+    // padding period L (physical(i) = i + floor(i/L)).
+    // Positive score = net improvement; negative = net harm.
+    // We pick the L with the highest score (> 0 means padding helps overall).
     // -----------------------------------------------------------------------
     if (!Info.HasUnknownAccess) {
-      // Aggregate all accesses (loads + stores) into a single list of
-      // (DominantStride, ConflictCount, Weight) tuples.
       struct StrideEntry {
-        int64_t Stride;     // Dominant stride in elements (Tx if != 0, else Ty)
-        int ConflictCount;
+        int64_t Stride;   // dominant stride in elements
+        int ConflictBefore;
         uint64_t Weight;
+        DimStrides FullStrides; // needed for 2D conflict recomputation
       };
       std::vector<StrideEntry> Entries;
 
       auto CollectEntries = [&](const std::vector<AccessInfo> &Accesses) {
         for (const auto &Acc : Accesses) {
-          // Use dominant stride (Tx first, then Ty)
           int64_t S = Acc.Strides.Tx != 0 ? Acc.Strides.Tx : Acc.Strides.Ty;
-          Entries.push_back({S, Acc.ConflictCount, Acc.Weight});
+          Entries.push_back({S, Acc.ConflictCount, Acc.Weight, Acc.Strides});
         }
       };
       CollectEntries(Info.Loads);
       CollectEntries(Info.Stores);
 
-      // Compute total weight for normalization (for display only)
       uint64_t TotalWeight = 0;
       for (auto &E : Entries)
         TotalWeight += E.Weight;
@@ -532,12 +569,8 @@ PreservedAnalyses SharedMemPass::run(Function &F, FunctionAnalysisManager &AM) {
       if (TotalWeight == 0) {
         errs() << "  [Padding] No accesses found.\n";
       } else {
-        // For each unique even stride > 1, compute its ideal L = lcm(S, 32).
-        // Collect candidate L values.
-        // gcd and lcm:
         auto GCD = [](int64_t A, int64_t B) -> int64_t {
-          A = std::abs(A);
-          B = std::abs(B);
+          A = std::abs(A); B = std::abs(B);
           while (B) { A %= B; std::swap(A, B); }
           return A;
         };
@@ -546,39 +579,49 @@ PreservedAnalyses SharedMemPass::run(Function &F, FunctionAnalysisManager &AM) {
           return (A / GCD(A, B)) * B;
         };
 
-        // Map: L -> Benefit(L)
-        std::map<int64_t, double> BenefitMap;
-
+        // Collect candidate L values from even strides that currently conflict.
+        std::set<int64_t> Candidates;
+        int EffBDX = HasKnownBlockDim ? BlockDimX : 32;
         for (auto &E : Entries) {
-          // Only even strides > 1 have conflicts that need padding
           if (E.Stride <= 1 || E.Stride % 2 != 0)
             continue;
-
-          int64_t IdealL = LCM(E.Stride, 32);
-          if (IdealL <= 0)
-            continue;
-
-          // Proportion of total accesses this entry represents
-          double Proportion = (double)E.Weight / (double)TotalWeight;
-          BenefitMap[IdealL] += Proportion * E.ConflictCount;
+          int64_t IdealL = LCM(std::abs(E.Stride), 32);
+          if (IdealL > 0)
+            Candidates.insert(IdealL);
         }
 
-        if (BenefitMap.empty()) {
-          errs() << "  [Padding] No conflicting even strides found. No padding needed.\n";
+        if (Candidates.empty()) {
+          errs() << "  [Padding] No conflicting even strides. No padding needed.\n";
         } else {
-          // Find L with maximum benefit
-          int64_t BestL = 0;
-          double BestBenefit = 0.0;
-          for (auto &[L, Benefit] : BenefitMap) {
+          // Evaluate each candidate L.
+          std::map<int64_t, double> ScoreMap;
+          for (int64_t L : Candidates) {
+            double Score = 0.0;
+            for (auto &E : Entries) {
+              double W = (double)E.Weight / (double)TotalWeight;
+              double After = computeBankConflictWithPadding(
+                  E.FullStrides, EffBDX, BlockDimY, L);
+              Score += W * ((double)E.ConflictBefore - After);
+            }
+            ScoreMap[L] = Score;
             errs() << "  [Padding] Candidate L=" << L
-                   << " Benefit=" << format("%.4f", Benefit) << "\n";
-            if (Benefit > BestBenefit) {
-              BestBenefit = Benefit;
+                   << " Score=" << format("%.4f", Score) << "\n";
+          }
+
+          // Pick L with maximum score (must be > 0 to be beneficial).
+          int64_t BestL = 0;
+          double BestScore = 0.0;
+          for (auto &[L, Score] : ScoreMap) {
+            if (Score > BestScore) {
+              BestScore = Score;
               BestL = L;
             }
           }
-          errs() << "  [Padding] >>> Recommended pad period: L=" << BestL
-                 << " (Benefit=" << format("%.4f", BestBenefit) << ")\n";
+          if (BestL > 0)
+            errs() << "  [Padding] >>> Recommended pad period: L=" << BestL
+                   << " (Score=" << format("%.4f", BestScore) << ")\n";
+          else
+            errs() << "  [Padding] >>> No padding beneficial (all scores <= 0)\n";
         }
       }
     }
