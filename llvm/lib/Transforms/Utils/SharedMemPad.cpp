@@ -265,7 +265,7 @@ static double computeBankConflictWithPadding(DimStrides S, int BlockDimX,
 
   // Cycle length in warps: one full padding period covers S*L logical elements.
   // Each warp covers 32*S elements, so: (S*L) / (32*S) = L/32.
-  int64_t CycleWarps = std::max((int64_t)1, PaddingL / 32);
+  int64_t CycleWarps = PaddingL / 32;
 
   double TotalConflict = 0.0;
   for (int64_t W = 0; W < CycleWarps; ++W) {
@@ -291,6 +291,12 @@ static double computeBankConflictWithPadding(DimStrides S, int BlockDimX,
 }
 
 PreservedAnalyses SharedMemPass::run(Function &F, FunctionAnalysisManager &AM) {
+  // Check if the target is NVPTX
+  Triple T(F.getParent()->getTargetTriple());
+  if (!T.isNVPTX()) {
+    return PreservedAnalyses::all();
+  }
+  
   // --- Load blockDim from JSON file if -cuda-blockdim-file was specified ---
   // Priority: JSON file > reqntidx attr > heuristic fallback
   int BlockDimX = 32, BlockDimY = 1, BlockDimZ = 1;
@@ -357,11 +363,6 @@ PreservedAnalyses SharedMemPass::run(Function &F, FunctionAnalysisManager &AM) {
   ScalarEvolution &SE = AM.getResult<ScalarEvolutionAnalysis>(F);
   BlockFrequencyInfo &BFI = AM.getResult<BlockFrequencyAnalysis>(F);
 
-  // Check if the target is NVPTX
-  Triple T(F.getParent()->getTargetTriple());
-  if (!T.isNVPTX()) {
-    return PreservedAnalyses::all();
-  }
 
   // Attempt to find the values representing threadIdx.x, y, z
   // In NVPTX, they are typically calls to @llvm.nvvm.read.ptx.sreg.tid.*()
@@ -451,13 +452,12 @@ PreservedAnalyses SharedMemPass::run(Function &F, FunctionAnalysisManager &AM) {
             // Use blockDim from JSON (loaded at function start).
             // If Ty/Tz are used but blockDim is unknown, we cannot determine
             // how threads distribute across X and Y, so mark UNKNOWN.
-            if (!HasKnownBlockDim && (S.Ty != 0 || S.Tz != 0)) {
+            if (!HasKnownBlockDim) {
               Case = StrideCase::UNKNOWN_CASE;
             } else {
               // For pure 1D access (only Tx), warp always fills X-dimension,
               // so BlockDimX=32 is safe even when blockDim is not known.
-              int EffBlockDimX = HasKnownBlockDim ? BlockDimX : 32;
-              int MaxConflict = computeBankConflict(S, EffBlockDimX, BlockDimY);
+              int MaxConflict = computeBankConflict(S, BlockDimX, BlockDimY);
               ConflictCount = MaxConflict;
 
               if (S.Tx == 0 && S.Ty == 0 && S.Tz == 0) {
@@ -581,7 +581,6 @@ PreservedAnalyses SharedMemPass::run(Function &F, FunctionAnalysisManager &AM) {
 
         // Collect candidate L values from even strides that currently conflict.
         std::set<int64_t> Candidates;
-        int EffBDX = HasKnownBlockDim ? BlockDimX : 32;
         for (auto &E : Entries) {
           if (E.Stride <= 1 || E.Stride % 2 != 0)
             continue;
@@ -600,7 +599,7 @@ PreservedAnalyses SharedMemPass::run(Function &F, FunctionAnalysisManager &AM) {
             for (auto &E : Entries) {
               double W = (double)E.Weight / (double)TotalWeight;
               double After = computeBankConflictWithPadding(
-                  E.FullStrides, EffBDX, BlockDimY, L);
+                  E.FullStrides, BlockDimX, BlockDimY, L);
               Score += W * ((double)E.ConflictBefore - After);
             }
             ScoreMap[L] = Score;
