@@ -1,16 +1,19 @@
 #include "llvm/Transforms/Utils/SharedMemPad.h"
 #include "llvm/Transforms/Utils/BlockGridDimensionAnalysis.h"
 #include "llvm/IR/Function.h"
+#include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/TargetParser/Triple.h"
 
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/Analysis/BlockFrequencyInfo.h"
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/Analysis/ScalarEvolutionExpressions.h"
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/DataLayout.h"
+#include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Instructions.h"
@@ -18,6 +21,7 @@
 #include "llvm/Support/Format.h"
 
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <set>
 #include <vector>
@@ -224,7 +228,225 @@ public:
 };
 
 
-// Helper: compute max bank conflict for one warp given strides and blockDim.
+// Returns the total number of base (float) elements in a (nested) array type.
+// e.g. [16 x [16 x float]] → 256.
+static int64_t computeFlatSize(Type *Ty) {
+  if (auto *AT = dyn_cast<ArrayType>(Ty))
+    return (int64_t)AT->getNumElements() * computeFlatSize(AT->getElementType());
+  return 1; // base element
+}
+
+// For GEP source type T = [A x [B x float]], returns strides for all
+// non-leading indices: [B, 1].  Works for any depth of nesting.
+static SmallVector<int64_t, 4> computeDimStrides(Type *SrcTy) {
+  SmallVector<int64_t, 4> Strides;
+  Type *Ty = SrcTy;
+  while (isa<ArrayType>(Ty)) {
+    Type *ElemTy = cast<ArrayType>(Ty)->getElementType();
+    Strides.push_back(computeFlatSize(ElemTy));
+    Ty = ElemTy;
+  }
+  return Strides;
+}
+
+// Replace a shared-memory GlobalVariable with a padded 1-D version.
+//
+// Original layout: GV  = [A x [B x float]]  (addrspace 3)
+// New layout:      GV' = [FlatSize + FlatSize/L x float]  (addrspace 3)
+//
+// Every GEP  "gep [AxB], ptr, 0, row, col"  is rewritten to
+//   flat      = row*B + col
+//   padded    = flat + udiv(flat, L)
+//   "gep [N], ptr', 0, padded"
+//
+// This walk covers unrolled GEPs automatically because every unrolled
+// iteration produces an independent GEP instruction, all of them users
+// of the same GlobalVariable (possibly through an addrspacecast CE).
+static void applyFlattenAndPad(GlobalVariable *GV, int64_t L) {
+  Module *M = GV->getParent();
+  LLVMContext &Ctx = M->getContext();
+  Type *I64Ty = Type::getInt64Ty(Ctx);
+
+  // 1. Compute sizes.
+  int64_t FlatSize = computeFlatSize(GV->getValueType());
+  int64_t PaddedSize = FlatSize + FlatSize / L;
+
+  // Scalar element type (float), obtained by unwrapping all array layers.
+  Type *ElemTy = GV->getValueType();
+  while (auto *AT = dyn_cast<ArrayType>(ElemTy))
+    ElemTy = AT->getElementType();
+
+  // 2. Create new 1-D global in the same address space.
+  ArrayType *NewTy = ArrayType::get(ElemTy, PaddedSize);
+  auto *NewGV = new GlobalVariable(
+      *M, NewTy, /*isConstant=*/false, GV->getLinkage(),
+      UndefValue::get(NewTy), GV->getName() + ".padded",
+      /*InsertBefore=*/nullptr,
+      GV->getThreadLocalMode(), GV->getAddressSpace());
+  NewGV->setAlignment(GV->getAlign());
+  NewGV->setUnnamedAddr(GV->getUnnamedAddr());
+
+  // 3. Collect all GEP users that transitively address GV.
+  //    Two kinds:
+  //    a) GEP instructions   (runtime indices, common case)
+  //    b) CE GEPs            (all indices are constants; appear after unrolling
+  //                           when the optimizer folds indices to constants)
+  //    Non-GEP CEs (addrspacecast, bitcast) are just passed through.
+  SmallVector<GetElementPtrInst *, 32> GEPsToReplace;
+  SmallVector<ConstantExpr *, 16> CEGEPsToReplace;
+
+  std::function<void(Value *)> Collect = [&](Value *V) {
+    for (User *U : V->users()) {
+      if (auto *GEP = dyn_cast<GetElementPtrInst>(U)) {
+        GEPsToReplace.push_back(GEP);
+      } else if (auto *CE = dyn_cast<ConstantExpr>(U)) {
+        if (CE->getOpcode() == Instruction::GetElementPtr) {
+          // CE is itself a GEP — collect it for constant-folded replacement.
+          CEGEPsToReplace.push_back(CE);
+        } else {
+          // addrspacecast / bitcast — recurse to find GEPs behind it.
+          Collect(CE);
+        }
+      } else if (auto *Cast = dyn_cast<AddrSpaceCastInst>(U)) {
+        Collect(Cast);
+      }
+    }
+  };
+  Collect(GV);
+
+  // Helper: given a CE GEP, return the flat element index as a constant.
+  //   Two forms are handled:
+  //   - Element form:  getelementptr [AxBxfloat], ptr, 0, row, col
+  //   - Byte-offset:   getelementptr i8, ptr, i64 <byteoffset>
+  //     (produced by the optimizer when all indices are constant).
+  const DataLayout &DL = M->getDataLayout();
+  uint64_t ElemSize = DL.getTypeAllocSize(ElemTy); // bytes per element
+
+  auto GetFlatIdxFromCEGEP = [&](ConstantExpr *CE) -> int64_t {
+    Type *SrcTy = CE->getOperand(0)->getType(); // ptr type — not element type
+    // Reconstruct the element type from the CE's source element type field.
+    // For a GEP CE, getOperand(0) is the base pointer; the source element type
+    // is embedded in the CE's sub-class data (accessed via
+    // cast<GEPOperator>).
+    auto *GEPOp = cast<GEPOperator>(CE);
+    Type *GEPSrcTy = GEPOp->getSourceElementType();
+    (void)SrcTy;
+
+    if (GEPSrcTy->isIntegerTy(8)) {
+      // Byte-offset form.  operand(1) is the byte offset.
+      int64_t ByteOff =
+          cast<ConstantInt>(CE->getOperand(1))->getSExtValue();
+      return ByteOff / (int64_t)ElemSize;
+    }
+
+    // Element form: indices are [0, i1, i2, ...]; skip the leading 0.
+    SmallVector<int64_t, 4> Strides = computeDimStrides(GEPSrcTy);
+    int64_t Flat = 0;
+    // CE operands: op[0]=ptr, op[1]=idx0(0), op[2]=row, op[3]=col, ...
+    for (unsigned i = 2; i < CE->getNumOperands(); ++i) {
+      int64_t IdxVal =
+          cast<ConstantInt>(CE->getOperand(i))->getSExtValue();
+      int64_t Stride = (i - 2 < Strides.size()) ? Strides[i - 2] : 1;
+      Flat += IdxVal * Stride;
+    }
+    return Flat;
+  };
+
+  // 4a. Transform each GEP instruction.
+  for (auto *GEP : GEPsToReplace) {
+    IRBuilder<> B(GEP);
+    SmallVector<int64_t, 4> Strides =
+        computeDimStrides(GEP->getSourceElementType());
+
+    // Compute flat index from multi-dim GEP indices.
+    // GEP operands: [ptr, idx0=0, idx1=row, idx2=col, ...]
+    // We skip idx0 (the outer "array-of-arrays" base index, always 0).
+    Value *FlatIdx = ConstantInt::get(I64Ty, 0);
+    for (unsigned int i = 1; i < GEP->getNumIndices(); ++i) {
+      Value *Idx = GEP->getOperand(i + 1); // op[0]=ptr, so op[i+1] = idx[i]
+      // Sign-extend / zero-extend to i64.
+      if (Idx->getType() != I64Ty) {
+        if (auto *CI = dyn_cast<ConstantInt>(Idx))
+          Idx = ConstantInt::get(I64Ty, CI->getSExtValue());
+        else
+          Idx = B.CreateSExt(Idx, I64Ty, "idx.ext");
+      }
+      // Strides[i-1]: stride for the i-th non-leading index.
+      int64_t Stride = (i - 1 < Strides.size()) ? Strides[i - 1] : 1;
+      FlatIdx = B.CreateAdd(
+          FlatIdx, B.CreateMul(Idx, ConstantInt::get(I64Ty, Stride), "fmul"),
+          "flat");
+    }
+
+    // Apply padding: padded = flat + udiv(flat, L).
+    Value *Pad = B.CreateUDiv(FlatIdx, ConstantInt::get(I64Ty, L), "pad");
+    Value *PaddedIdx = B.CreateAdd(FlatIdx, Pad, "padded");
+
+    // Build a pointer to the new global in the right address space.
+    unsigned PtrAS =
+        GEP->getPointerOperand()->getType()->getPointerAddressSpace();
+    Value *NewPtr;
+    if (NewGV->getAddressSpace() == PtrAS) {
+      NewPtr = NewGV;
+    } else {
+      NewPtr = ConstantExpr::getAddrSpaceCast(
+          NewGV, PointerType::get(Ctx, PtrAS));
+    }
+
+    // Emit new 1-D GEP.
+    Value *Idxs[] = {ConstantInt::get(I64Ty, 0), PaddedIdx};
+    Value *NewGEP =
+        B.CreateGEP(NewTy, NewPtr, Idxs, GEP->getName() + ".padded",
+                    GEP->isInBounds());
+
+    GEP->replaceAllUsesWith(NewGEP);
+    GEP->eraseFromParent();
+  }
+
+  // 4b. Transform each ConstantExpr GEP.
+  //     Because all indices are constants, the padded index is also a constant
+  //     — no instruction insertion needed.
+  for (auto *CE : CEGEPsToReplace) {
+    int64_t Flat = GetFlatIdxFromCEGEP(CE);
+    if (Flat < 0 || Flat >= FlatSize) {
+      errs() << "  [Transform] WARNING: CE GEP flat index " << Flat
+             << " out of range for " << GV->getName() << ", skipping.\n";
+      continue;
+    }
+    int64_t PaddedIdx = Flat + Flat / L;
+
+    // Build a constant pointer to NewGV in the right address space.
+    unsigned PtrAS =
+        CE->getType()->getPointerAddressSpace();
+    Constant *NewPtr;
+    if (NewGV->getAddressSpace() == PtrAS) {
+      NewPtr = NewGV;
+    } else {
+      NewPtr = ConstantExpr::getAddrSpaceCast(
+          NewGV, PointerType::get(Ctx, PtrAS));
+    }
+
+    // Build new CE GEP: getelementptr [N x float], ptr, 0, padded_idx.
+    Constant *NewIdxs[] = {ConstantInt::get(I64Ty, 0),
+                           ConstantInt::get(I64Ty, PaddedIdx)};
+    Constant *NewCE =
+        ConstantExpr::getGetElementPtr(NewTy, NewPtr, NewIdxs, /*InBounds=*/true);
+
+    CE->replaceAllUsesWith(NewCE);
+    CE->destroyConstant();
+  }
+
+  // 5. Remove the old global (all instruction uses replaced; constant-expr
+  //    users are now dead and will be cleaned up).
+  GV->removeDeadConstantUsers();
+  if (GV->use_empty())
+    GV->eraseFromParent();
+
+  errs() << "  [Transform] Flattened & padded: " << GV->getName()
+         << " → size " << FlatSize << " + " << FlatSize / L
+         << " = " << PaddedSize << " (L=" << L << ")\n";
+}
+
 static int computeBankConflict(DimStrides S, int BlockDimX, int BlockDimY) {
   int Banks[32] = {0};
   int MaxConflict = 0;
@@ -301,6 +523,7 @@ PreservedAnalyses SharedMemPass::run(Function &F, FunctionAnalysisManager &AM) {
   // Priority: JSON file > reqntidx attr > heuristic fallback
   int BlockDimX = 32, BlockDimY = 1, BlockDimZ = 1;
   bool HasKnownBlockDim = false;
+  bool Modified = false;
 
   if (!BlockDimFile.empty()) {
     auto ResultOrErr =
@@ -616,15 +839,22 @@ PreservedAnalyses SharedMemPass::run(Function &F, FunctionAnalysisManager &AM) {
               BestL = L;
             }
           }
-          if (BestL > 0)
+          if (BestL > 0) {
             errs() << "  [Padding] >>> Recommended pad period: L=" << BestL
                    << " (Score=" << format("%.4f", BestScore) << ")\n";
-          else
+            // Apply the transformation: flatten the array and insert
+            // padded index = flat + flat/L for every GEP.
+            if (auto *GV = dyn_cast<GlobalVariable>(BaseVar)) {
+              applyFlattenAndPad(GV, BestL);
+              Modified = true;
+            }
+          } else {
             errs() << "  [Padding] >>> No padding beneficial (all scores <= 0)\n";
+          }
         }
       }
     }
   }
 
-  return PreservedAnalyses::all();
+  return Modified ? PreservedAnalyses::none() : PreservedAnalyses::all();
 }
