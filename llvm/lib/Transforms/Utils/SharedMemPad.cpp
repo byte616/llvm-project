@@ -1,11 +1,11 @@
 #include "llvm/Transforms/Utils/SharedMemPad.h"
-#include "llvm/Transforms/Utils/BlockGridDimensionAnalysis.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/TargetParser/Triple.h"
+#include "llvm/Transforms/Utils/BlockGridDimensionAnalysis.h"
 
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Analysis/BlockFrequencyInfo.h"
@@ -37,8 +37,7 @@ static cl::opt<std::string> BlockDimFile(
     "cuda-blockdim-file",
     cl::desc("JSON file with CUDA kernel block dimensions (produced by "
              "running 'opt -passes=cuda-blockdim-extract' on host IR)"),
-    cl::value_desc("filename"),
-    cl::init(""));
+    cl::value_desc("filename"), cl::init(""));
 
 // target machine: NV GPU
 // 1. Calculate the access stride of shared memory between all the threads in
@@ -106,7 +105,8 @@ struct SharedMemVarInfo {
   Value *BaseVar;                // The shared memory variable (Alloca / Global)
   std::vector<AccessInfo> Loads; // List of Load accesses
   std::vector<AccessInfo> Stores; // List of Store accesses
-  bool HasUnknownAccess = false; // if there exists unknown access, we cannot pad
+  bool HasUnknownAccess =
+      false; // if there exists unknown access, we cannot pad
 };
 
 // SCEV Visitor to traverse the expression tree and find the coefficient of tid
@@ -224,15 +224,14 @@ public:
   DimStrides visitSMinExpr(const SCEVSMinExpr *Expr) { return {0, 0, 0, true}; }
   DimStrides visitUMaxExpr(const SCEVUMaxExpr *Expr) { return {0, 0, 0, true}; }
   DimStrides visitUMinExpr(const SCEVUMinExpr *Expr) { return {0, 0, 0, true}; }
-
 };
-
 
 // Returns the total number of base (float) elements in a (nested) array type.
 // e.g. [16 x [16 x float]] → 256.
 static int64_t computeFlatSize(Type *Ty) {
   if (auto *AT = dyn_cast<ArrayType>(Ty))
-    return (int64_t)AT->getNumElements() * computeFlatSize(AT->getElementType());
+    return (int64_t)AT->getNumElements() *
+           computeFlatSize(AT->getElementType());
   return 1; // base element
 }
 
@@ -278,11 +277,11 @@ static void applyFlattenAndPad(GlobalVariable *GV, int64_t L) {
 
   // 2. Create new 1-D global in the same address space.
   ArrayType *NewTy = ArrayType::get(ElemTy, PaddedSize);
-  auto *NewGV = new GlobalVariable(
-      *M, NewTy, /*isConstant=*/false, GV->getLinkage(),
-      UndefValue::get(NewTy), GV->getName() + ".padded",
-      /*InsertBefore=*/nullptr,
-      GV->getThreadLocalMode(), GV->getAddressSpace());
+  auto *NewGV =
+      new GlobalVariable(*M, NewTy, /*isConstant=*/false, GV->getLinkage(),
+                         UndefValue::get(NewTy), GV->getName() + ".padded",
+                         /*InsertBefore=*/nullptr, GV->getThreadLocalMode(),
+                         GV->getAddressSpace());
   NewGV->setAlignment(GV->getAlign());
   NewGV->setUnnamedAddr(GV->getUnnamedAddr());
 
@@ -303,13 +302,17 @@ static void applyFlattenAndPad(GlobalVariable *GV, int64_t L) {
         if (CE->getOpcode() == Instruction::GetElementPtr) {
           // CE is itself a GEP — collect it for constant-folded replacement.
           CEGEPsToReplace.push_back(CE);
-        } else {
-          // addrspacecast / bitcast — recurse to find GEPs behind it.
-          Collect(CE);
         }
+        // Always recurse: downstream GEP *instructions* may use this CE
+        // as their pointer operand (e.g. CE GEP → GEP instruction chain).
+        Collect(CE);
       } else if (auto *Cast = dyn_cast<AddrSpaceCastInst>(U)) {
         Collect(Cast);
+      } else if (auto *Cast = dyn_cast<BitCastInst>(U)) {
+        Collect(Cast);
       }
+      // Note: PHINode and SelectInst are not handled — those would require
+      // more complex analysis to track all incoming values.
     }
   };
   Collect(GV);
@@ -334,8 +337,7 @@ static void applyFlattenAndPad(GlobalVariable *GV, int64_t L) {
 
     if (GEPSrcTy->isIntegerTy(8)) {
       // Byte-offset form.  operand(1) is the byte offset.
-      int64_t ByteOff =
-          cast<ConstantInt>(CE->getOperand(1))->getSExtValue();
+      int64_t ByteOff = cast<ConstantInt>(CE->getOperand(1))->getSExtValue();
       return ByteOff / (int64_t)ElemSize;
     }
 
@@ -344,8 +346,7 @@ static void applyFlattenAndPad(GlobalVariable *GV, int64_t L) {
     int64_t Flat = 0;
     // CE operands: op[0]=ptr, op[1]=idx0(0), op[2]=row, op[3]=col, ...
     for (unsigned i = 2; i < CE->getNumOperands(); ++i) {
-      int64_t IdxVal =
-          cast<ConstantInt>(CE->getOperand(i))->getSExtValue();
+      int64_t IdxVal = cast<ConstantInt>(CE->getOperand(i))->getSExtValue();
       int64_t Stride = (i - 2 < Strides.size()) ? Strides[i - 2] : 1;
       Flat += IdxVal * Stride;
     }
@@ -355,27 +356,45 @@ static void applyFlattenAndPad(GlobalVariable *GV, int64_t L) {
   // 4a. Transform each GEP instruction.
   for (auto *GEP : GEPsToReplace) {
     IRBuilder<> B(GEP);
-    SmallVector<int64_t, 4> Strides =
-        computeDimStrides(GEP->getSourceElementType());
+    Type *GEPSrcTy = GEP->getSourceElementType();
 
-    // Compute flat index from multi-dim GEP indices.
-    // GEP operands: [ptr, idx0=0, idx1=row, idx2=col, ...]
-    // We skip idx0 (the outer "array-of-arrays" base index, always 0).
-    Value *FlatIdx = ConstantInt::get(I64Ty, 0);
-    for (unsigned int i = 1; i < GEP->getNumIndices(); ++i) {
-      Value *Idx = GEP->getOperand(i + 1); // op[0]=ptr, so op[i+1] = idx[i]
-      // Sign-extend / zero-extend to i64.
-      if (Idx->getType() != I64Ty) {
-        if (auto *CI = dyn_cast<ConstantInt>(Idx))
-          Idx = ConstantInt::get(I64Ty, CI->getSExtValue());
+    Value *FlatIdx;
+
+    // Handle byte-offset form: getelementptr i8, ptr, i64 <byteoffset>
+    if (GEPSrcTy->isIntegerTy(8) && GEP->getNumIndices() == 1) {
+      Value *ByteOff = GEP->getOperand(1);
+      if (ByteOff->getType() != I64Ty) {
+        if (auto *CI = dyn_cast<ConstantInt>(ByteOff))
+          ByteOff = ConstantInt::get(I64Ty, CI->getSExtValue());
         else
-          Idx = B.CreateSExt(Idx, I64Ty, "idx.ext");
+          ByteOff = B.CreateSExt(ByteOff, I64Ty, "byteoff.ext");
       }
-      // Strides[i-1]: stride for the i-th non-leading index.
-      int64_t Stride = (i - 1 < Strides.size()) ? Strides[i - 1] : 1;
-      FlatIdx = B.CreateAdd(
-          FlatIdx, B.CreateMul(Idx, ConstantInt::get(I64Ty, Stride), "fmul"),
-          "flat");
+      // Convert byte offset to element index
+      FlatIdx =
+          B.CreateSDiv(ByteOff, ConstantInt::get(I64Ty, ElemSize), "elem.idx");
+    } else {
+      // Element form: getelementptr [AxB], ptr, 0, row, col, ...
+      SmallVector<int64_t, 4> Strides = computeDimStrides(GEPSrcTy);
+
+      // Compute flat index from multi-dim GEP indices.
+      // GEP operands: [ptr, idx0=0, idx1=row, idx2=col, ...]
+      // We skip idx0 (the outer "array-of-arrays" base index, always 0).
+      FlatIdx = ConstantInt::get(I64Ty, 0);
+      for (unsigned int i = 1; i < GEP->getNumIndices(); ++i) {
+        Value *Idx = GEP->getOperand(i + 1); // op[0]=ptr, so op[i+1] = idx[i]
+        // Sign-extend / zero-extend to i64.
+        if (Idx->getType() != I64Ty) {
+          if (auto *CI = dyn_cast<ConstantInt>(Idx))
+            Idx = ConstantInt::get(I64Ty, CI->getSExtValue());
+          else
+            Idx = B.CreateSExt(Idx, I64Ty, "idx.ext");
+        }
+        // Strides[i-1]: stride for the i-th non-leading index.
+        int64_t Stride = (i - 1 < Strides.size()) ? Strides[i - 1] : 1;
+        FlatIdx = B.CreateAdd(
+            FlatIdx, B.CreateMul(Idx, ConstantInt::get(I64Ty, Stride), "fmul"),
+            "flat");
+      }
     }
 
     // Apply padding: padded = flat + udiv(flat, L).
@@ -389,15 +408,14 @@ static void applyFlattenAndPad(GlobalVariable *GV, int64_t L) {
     if (NewGV->getAddressSpace() == PtrAS) {
       NewPtr = NewGV;
     } else {
-      NewPtr = ConstantExpr::getAddrSpaceCast(
-          NewGV, PointerType::get(Ctx, PtrAS));
+      NewPtr =
+          ConstantExpr::getAddrSpaceCast(NewGV, PointerType::get(Ctx, PtrAS));
     }
 
     // Emit new 1-D GEP.
     Value *Idxs[] = {ConstantInt::get(I64Ty, 0), PaddedIdx};
-    Value *NewGEP =
-        B.CreateGEP(NewTy, NewPtr, Idxs, GEP->getName() + ".padded",
-                    GEP->isInBounds());
+    Value *NewGEP = B.CreateGEP(NewTy, NewPtr, Idxs, GEP->getName() + ".padded",
+                                GEP->isInBounds());
 
     GEP->replaceAllUsesWith(NewGEP);
     GEP->eraseFromParent();
@@ -416,21 +434,20 @@ static void applyFlattenAndPad(GlobalVariable *GV, int64_t L) {
     int64_t PaddedIdx = Flat + Flat / L;
 
     // Build a constant pointer to NewGV in the right address space.
-    unsigned PtrAS =
-        CE->getType()->getPointerAddressSpace();
+    unsigned PtrAS = CE->getType()->getPointerAddressSpace();
     Constant *NewPtr;
     if (NewGV->getAddressSpace() == PtrAS) {
       NewPtr = NewGV;
     } else {
-      NewPtr = ConstantExpr::getAddrSpaceCast(
-          NewGV, PointerType::get(Ctx, PtrAS));
+      NewPtr =
+          ConstantExpr::getAddrSpaceCast(NewGV, PointerType::get(Ctx, PtrAS));
     }
 
     // Build new CE GEP: getelementptr [N x float], ptr, 0, padded_idx.
     Constant *NewIdxs[] = {ConstantInt::get(I64Ty, 0),
                            ConstantInt::get(I64Ty, PaddedIdx)};
-    Constant *NewCE =
-        ConstantExpr::getGetElementPtr(NewTy, NewPtr, NewIdxs, /*InBounds=*/true);
+    Constant *NewCE = ConstantExpr::getGetElementPtr(NewTy, NewPtr, NewIdxs,
+                                                     /*InBounds=*/true);
 
     CE->replaceAllUsesWith(NewCE);
     CE->destroyConstant();
@@ -442,22 +459,23 @@ static void applyFlattenAndPad(GlobalVariable *GV, int64_t L) {
   if (GV->use_empty())
     GV->eraseFromParent();
 
-  errs() << "  [Transform] Flattened & padded: " << GV->getName()
-         << " → size " << FlatSize << " + " << FlatSize / L
-         << " = " << PaddedSize << " (L=" << L << ")\n";
+  errs() << "  [Transform] Flattened & padded: " << GV->getName() << " → size "
+         << FlatSize << " + " << FlatSize / L << " = " << PaddedSize
+         << " (L=" << L << ")\n";
 }
 
 static int computeBankConflict(DimStrides S, int BlockDimX, int BlockDimY) {
   int Banks[32] = {0};
   int MaxConflict = 0;
-  std::set<int> Address;
+  std::set<int64_t> Address;
   for (int T = 0; T < 32; ++T) {
     int ThreadX = T % BlockDimX;
     int ThreadY = T / BlockDimX;
     int64_t ElementIndex = ThreadX * S.Tx + ThreadY * S.Ty;
     if (!Address.count(ElementIndex)) {
       Address.insert(ElementIndex);
-      int Bank = std::abs((int)(ElementIndex % 32));
+      // Correct modulo for negative numbers: ((x % 32) + 32) % 32
+      int Bank = (int)(((ElementIndex % 32) + 32) % 32);
       Banks[Bank]++;
       MaxConflict = std::max(MaxConflict, Banks[Bank]);
     }
@@ -478,10 +496,12 @@ static int computeBankConflict(DimStrides S, int BlockDimX, int BlockDimY) {
 //
 // Returns a double so the caller can compare fractional averages.
 static double computeBankConflictWithPadding(DimStrides S, int BlockDimX,
-                                              int BlockDimY, int64_t PaddingL) {
+                                             int BlockDimY, int64_t PaddingL) {
 
-  // Dominant stride: prefer Tx, then Ty.
-  int64_t DomStride = (S.Tx != 0) ? std::abs(S.Tx) : std::abs(S.Ty);
+  // Dominant stride: prefer Tx, then Ty, then Tz.
+  int64_t DomStride = (S.Tx != 0)   ? std::abs(S.Tx)
+                      : (S.Ty != 0) ? std::abs(S.Ty)
+                                    : std::abs(S.Tz);
   if (DomStride == 0)
     return 1.0; // broadcast -- always 1 (no conflict)
 
@@ -497,13 +517,18 @@ static double computeBankConflictWithPadding(DimStrides S, int BlockDimX,
     for (int T = 0; T < 32; ++T) {
       int ThreadX = T % BlockDimX;
       int ThreadY = T / BlockDimX;
-      int64_t Logical = W * 32 * DomStride + ThreadX * S.Tx + ThreadY * S.Ty;
+      // Use absolute value of dominant stride for warp offset calculation,
+      // but preserve sign in thread-local calculation for correct relative
+      // positioning
+      int64_t Logical =
+          W * 32 * DomStride + std::abs(ThreadX * S.Tx + ThreadY * S.Ty);
       if (Seen.count(Logical))
         continue;
       Seen.insert(Logical);
-      int64_t LogAbs = std::abs(Logical);
-      int64_t Physical = LogAbs + LogAbs / PaddingL;
-      int Bank = (int)(Physical % 32);
+      int64_t Physical = Logical + Logical / PaddingL;
+      // Correct modulo for negative numbers (though Logical should be
+      // non-negative now)
+      int Bank = (int)(((Physical % 32) + 32) % 32);
       Banks[Bank]++;
       MaxConflict = std::max(MaxConflict, Banks[Bank]);
     }
@@ -518,7 +543,7 @@ PreservedAnalyses SharedMemPass::run(Function &F, FunctionAnalysisManager &AM) {
   if (!T.isNVPTX()) {
     return PreservedAnalyses::all();
   }
-  
+
   // --- Load blockDim from JSON file if -cuda-blockdim-file was specified ---
   // Priority: JSON file > reqntidx attr > heuristic fallback
   int BlockDimX = 32, BlockDimY = 1, BlockDimZ = 1;
@@ -557,9 +582,9 @@ PreservedAnalyses SharedMemPass::run(Function &F, FunctionAnalysisManager &AM) {
           for (auto &[StubName, BGD] : BGDs) {
             if (StringRef(StubName).ends_with(Suffix)) {
               It = BGDs.find(StubName);
-              errs() << "[SharedMemPass] Matched device '"
-                                << DeviceName << "' to stub '" << StubName
-                                << "' via suffix '" << Suffix << "'\n";
+              errs() << "[SharedMemPass] Matched device '" << DeviceName
+                     << "' to stub '" << StubName << "' via suffix '" << Suffix
+                     << "'\n";
               break;
             }
           }
@@ -568,16 +593,19 @@ PreservedAnalyses SharedMemPass::run(Function &F, FunctionAnalysisManager &AM) {
 
       if (It != BGDs.end()) {
         auto &BD = It->second.BlockDim;
-        if (BD.X) BlockDimX = static_cast<int>(*BD.X);
-        if (BD.Y) BlockDimY = static_cast<int>(*BD.Y);
-        if (BD.Z) BlockDimZ = static_cast<int>(*BD.Z);
+        if (BD.X)
+          BlockDimX = static_cast<int>(*BD.X);
+        if (BD.Y)
+          BlockDimY = static_cast<int>(*BD.Y);
+        if (BD.Z)
+          BlockDimZ = static_cast<int>(*BD.Z);
         HasKnownBlockDim = true;
         errs() << "[SharedMemPass] Loaded blockDim from JSON for '"
-                          << DeviceName << "': (" << BlockDimX << ", "
-                          << BlockDimY << ", " << BlockDimZ << ")\n";
+               << DeviceName << "': (" << BlockDimX << ", " << BlockDimY << ", "
+               << BlockDimZ << ")\n";
       } else {
-        errs() << "[SharedMemPass] No JSON entry found for '"
-                          << DeviceName << "'\n";
+        errs() << "[SharedMemPass] No JSON entry found for '" << DeviceName
+               << "'\n";
       }
     }
   }
@@ -585,7 +613,6 @@ PreservedAnalyses SharedMemPass::run(Function &F, FunctionAnalysisManager &AM) {
   // Get ScalarEvolution Analysis and BlockFrequency Analysis
   ScalarEvolution &SE = AM.getResult<ScalarEvolutionAnalysis>(F);
   BlockFrequencyInfo &BFI = AM.getResult<BlockFrequencyAnalysis>(F);
-
 
   // Attempt to find the values representing threadIdx.x, y, z
   // In NVPTX, they are typically calls to @llvm.nvvm.read.ptx.sreg.tid.*()
@@ -663,7 +690,7 @@ PreservedAnalyses SharedMemPass::run(Function &F, FunctionAnalysisManager &AM) {
           const SCEV *Expr = SE.getSCEV(PtrOp);
           StrideVisitor Visitor(SE, TidX, TidY, TidZ);
           S = Visitor.visit(Expr);
-          
+
           if (S.IsUnknown) {
             Case = StrideCase::UNKNOWN_CASE;
           } else {
@@ -696,9 +723,12 @@ PreservedAnalyses SharedMemPass::run(Function &F, FunctionAnalysisManager &AM) {
           }
         }
 
-        std::optional<uint64_t> ProfileCount = BFI.getBlockProfileCount(I.getParent());
-        uint64_t Weight = ProfileCount.has_value() ? ProfileCount.value() : BFI.getBlockFreq(I.getParent()).getFrequency();
-        
+        std::optional<uint64_t> ProfileCount =
+            BFI.getBlockProfileCount(I.getParent());
+        uint64_t Weight = ProfileCount.has_value()
+                              ? ProfileCount.value()
+                              : BFI.getBlockFreq(I.getParent()).getFrequency();
+
         AccessInfo Info = {&I, S, Case, Weight, ConflictCount};
         SharedMemInfoMap[BaseVar].BaseVar = BaseVar;
         if (Case == StrideCase::UNKNOWN_CASE) {
@@ -725,27 +755,31 @@ PreservedAnalyses SharedMemPass::run(Function &F, FunctionAnalysisManager &AM) {
 
     errs() << "Variable: " << *BaseVar << "\n";
     if (Info.HasUnknownAccess) {
-      errs() << "  [WARNING] Variable has UNKNOWN accesses. Cannot safely pad.\n";
+      errs()
+          << "  [WARNING] Variable has UNKNOWN accesses. Cannot safely pad.\n";
     }
 
     std::map<std::pair<std::string, int>, uint64_t> LoadWeights;
     std::map<std::pair<std::string, int>, uint64_t> StoreWeights;
 
     auto FormatStride = [](DimStrides S, int Conflicts) {
-      std::string Str = "Tx:" + std::to_string(S.Tx) + " Ty:" + std::to_string(S.Ty) + " (" + std::to_string(Conflicts) + "-way bank conflict)";
+      std::string Str = "Tx:" + std::to_string(S.Tx) +
+                        " Ty:" + std::to_string(S.Ty) + " (" +
+                        std::to_string(Conflicts) + "-way bank conflict)";
       return Str;
     };
 
     for (auto &Acc : Info.Loads) {
-      LoadWeights[{FormatStride(Acc.Strides, Acc.ConflictCount), (int)Acc.CaseType}] += Acc.Weight;
+      LoadWeights[{FormatStride(Acc.Strides, Acc.ConflictCount),
+                   (int)Acc.CaseType}] += Acc.Weight;
     }
     for (auto &Acc : Info.Stores) {
-      StoreWeights[{FormatStride(Acc.Strides, Acc.ConflictCount), (int)Acc.CaseType}] += Acc.Weight;
+      StoreWeights[{FormatStride(Acc.Strides, Acc.ConflictCount),
+                    (int)Acc.CaseType}] += Acc.Weight;
     }
 
     for (auto &Pair : LoadWeights) {
-      errs() << "  Load " << Pair.first.first
-             << " (Case: " << Pair.first.second
+      errs() << "  Load " << Pair.first.first << " (Case: " << Pair.first.second
              << ") - Estimated Accesses: " << Pair.second << "\n";
     }
     for (auto &Pair : StoreWeights) {
@@ -769,7 +803,7 @@ PreservedAnalyses SharedMemPass::run(Function &F, FunctionAnalysisManager &AM) {
     // -----------------------------------------------------------------------
     if (!Info.HasUnknownAccess) {
       struct StrideEntry {
-        int64_t Stride;   // dominant stride in elements
+        int64_t Stride; // dominant stride in elements
         int ConflictBefore;
         uint64_t Weight;
         DimStrides FullStrides; // needed for 2D conflict recomputation
@@ -778,7 +812,10 @@ PreservedAnalyses SharedMemPass::run(Function &F, FunctionAnalysisManager &AM) {
 
       auto CollectEntries = [&](const std::vector<AccessInfo> &Accesses) {
         for (const auto &Acc : Accesses) {
-          int64_t S = Acc.Strides.Tx != 0 ? Acc.Strides.Tx : Acc.Strides.Ty;
+          // Pick the dominant stride: prefer Tx, then Ty, then Tz
+          int64_t S = Acc.Strides.Tx != 0   ? Acc.Strides.Tx
+                      : Acc.Strides.Ty != 0 ? Acc.Strides.Ty
+                                            : Acc.Strides.Tz;
           Entries.push_back({S, Acc.ConflictCount, Acc.Weight, Acc.Strides});
         }
       };
@@ -793,27 +830,34 @@ PreservedAnalyses SharedMemPass::run(Function &F, FunctionAnalysisManager &AM) {
         errs() << "  [Padding] No accesses found.\n";
       } else {
         auto GCD = [](int64_t A, int64_t B) -> int64_t {
-          A = std::abs(A); B = std::abs(B);
-          while (B) { A %= B; std::swap(A, B); }
+          A = std::abs(A);
+          B = std::abs(B);
+          while (B) {
+            A %= B;
+            std::swap(A, B);
+          }
           return A;
         };
         auto LCM = [&GCD](int64_t A, int64_t B) -> int64_t {
-          if (A == 0 || B == 0) return 0;
+          if (A == 0 || B == 0)
+            return 0;
           return (A / GCD(A, B)) * B;
         };
 
         // Collect candidate L values from even strides that currently conflict.
         std::set<int64_t> Candidates;
         for (auto &E : Entries) {
-          if (E.Stride <= 1 || E.Stride % 2 != 0)
+          int64_t AbsStride = std::abs(E.Stride);
+          if (AbsStride <= 1 || AbsStride % 2 != 0)
             continue;
-          int64_t IdealL = LCM(std::abs(E.Stride), 32);
+          int64_t IdealL = LCM(AbsStride, 32);
           if (IdealL > 0)
             Candidates.insert(IdealL);
         }
 
         if (Candidates.empty()) {
-          errs() << "  [Padding] No conflicting even strides. No padding needed.\n";
+          errs() << "  [Padding] No conflicting even strides. No padding "
+                    "needed.\n";
         } else {
           // Evaluate each candidate L.
           std::map<int64_t, double> ScoreMap;
@@ -849,7 +893,8 @@ PreservedAnalyses SharedMemPass::run(Function &F, FunctionAnalysisManager &AM) {
               Modified = true;
             }
           } else {
-            errs() << "  [Padding] >>> No padding beneficial (all scores <= 0)\n";
+            errs()
+                << "  [Padding] >>> No padding beneficial (all scores <= 0)\n";
           }
         }
       }
