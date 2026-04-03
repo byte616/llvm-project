@@ -286,13 +286,15 @@ static void applyFlattenAndPad(GlobalVariable *GV, int64_t L) {
   NewGV->setUnnamedAddr(GV->getUnnamedAddr());
 
   // 3. Collect all GEP users that transitively address GV.
-  //    Two kinds:
+  //    Three kinds:
   //    a) GEP instructions   (runtime indices, common case)
   //    b) CE GEPs            (all indices are constants; appear after unrolling
   //                           when the optimizer folds indices to constants)
+  //    c) Direct Load/Store  (access to base pointer, i.e., flat index 0)
   //    Non-GEP CEs (addrspacecast, bitcast) are just passed through.
   SmallVector<GetElementPtrInst *, 32> GEPsToReplace;
   SmallVector<ConstantExpr *, 16> CEGEPsToReplace;
+  SmallVector<Instruction *, 8> DirectAccessesToReplace; // Load/Store to base
 
   std::function<void(Value *)> Collect = [&](Value *V) {
     for (User *U : V->users()) {
@@ -310,6 +312,15 @@ static void applyFlattenAndPad(GlobalVariable *GV, int64_t L) {
         Collect(Cast);
       } else if (auto *Cast = dyn_cast<BitCastInst>(U)) {
         Collect(Cast);
+      } else if (auto *LI = dyn_cast<LoadInst>(U)) {
+        // Direct load from base pointer (flat index 0)
+        DirectAccessesToReplace.push_back(LI);
+      } else if (auto *SI = dyn_cast<StoreInst>(U)) {
+        // Direct store to base pointer (flat index 0)
+        // Make sure V is the pointer operand, not the value being stored
+        if (SI->getPointerOperand() == V) {
+          DirectAccessesToReplace.push_back(SI);
+        }
       }
       // Note: PHINode and SelectInst are not handled — those would require
       // more complex analysis to track all incoming values.
@@ -451,6 +462,43 @@ static void applyFlattenAndPad(GlobalVariable *GV, int64_t L) {
 
     CE->replaceAllUsesWith(NewCE);
     CE->destroyConstant();
+  }
+
+  // 4c. Transform direct Load/Store to base pointer (flat index 0).
+  //     These access element 0, which after padding is still element 0.
+  //     We need to redirect them to use the new padded global.
+  for (auto *Inst : DirectAccessesToReplace) {
+    IRBuilder<> B(Inst);
+
+    // Get the pointer operand and its address space
+    Value *OldPtr;
+    if (auto *LI = dyn_cast<LoadInst>(Inst)) {
+      OldPtr = LI->getPointerOperand();
+    } else {
+      OldPtr = cast<StoreInst>(Inst)->getPointerOperand();
+    }
+    unsigned PtrAS = OldPtr->getType()->getPointerAddressSpace();
+
+    // Build a pointer to element 0 of the new global
+    Value *NewPtr;
+    if (NewGV->getAddressSpace() == PtrAS) {
+      NewPtr = NewGV;
+    } else {
+      NewPtr =
+          ConstantExpr::getAddrSpaceCast(NewGV, PointerType::get(Ctx, PtrAS));
+    }
+
+    // Flat index 0, padded index = 0 + 0/L = 0
+    Value *Idxs[] = {ConstantInt::get(I64Ty, 0), ConstantInt::get(I64Ty, 0)};
+    Value *NewGEP = B.CreateGEP(NewTy, NewPtr, Idxs, "base.padded");
+
+    // Replace the pointer operand in the load/store
+    if (auto *LI = dyn_cast<LoadInst>(Inst)) {
+      LI->setOperand(LI->getPointerOperandIndex(), NewGEP);
+    } else {
+      auto *SI = cast<StoreInst>(Inst);
+      SI->setOperand(SI->getPointerOperandIndex(), NewGEP);
+    }
   }
 
   // 5. Remove the old global (all instruction uses replaced; constant-expr
