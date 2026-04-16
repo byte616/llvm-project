@@ -261,14 +261,14 @@ static SmallVector<int64_t, 4> computeDimStrides(Type *SrcTy) {
 // This walk covers unrolled GEPs automatically because every unrolled
 // iteration produces an independent GEP instruction, all of them users
 // of the same GlobalVariable (possibly through an addrspacecast CE).
-static void applyFlattenAndPad(GlobalVariable *GV, int64_t L) {
+static void applyFlattenAndPad(GlobalVariable *GV, int64_t L, int64_t N) {
   Module *M = GV->getParent();
   LLVMContext &Ctx = M->getContext();
   Type *I64Ty = Type::getInt64Ty(Ctx);
 
   // 1. Compute sizes.
   int64_t FlatSize = computeFlatSize(GV->getValueType());
-  int64_t PaddedSize = FlatSize + FlatSize / L;
+  int64_t PaddedSize = FlatSize + N * (FlatSize / L);
 
   // Scalar element type (float), obtained by unwrapping all array layers.
   Type *ElemTy = GV->getValueType();
@@ -408,9 +408,12 @@ static void applyFlattenAndPad(GlobalVariable *GV, int64_t L) {
       }
     }
 
-    // Apply padding: padded = flat + udiv(flat, L).
+    // Apply padding: padded = flat + N * udiv(flat, L).
     Value *Pad = B.CreateUDiv(FlatIdx, ConstantInt::get(I64Ty, L), "pad");
-    Value *PaddedIdx = B.CreateAdd(FlatIdx, Pad, "padded");
+    Value *ScaledPad = (N == 1) ? Pad
+                                : B.CreateMul(Pad, ConstantInt::get(I64Ty, N),
+                                              "scaled.pad");
+    Value *PaddedIdx = B.CreateAdd(FlatIdx, ScaledPad, "padded");
 
     // Build a pointer to the new global in the right address space.
     unsigned PtrAS =
@@ -442,7 +445,7 @@ static void applyFlattenAndPad(GlobalVariable *GV, int64_t L) {
              << " out of range for " << GV->getName() << ", skipping.\n";
       continue;
     }
-    int64_t PaddedIdx = Flat + Flat / L;
+    int64_t PaddedIdx = Flat + N * (Flat / L);
 
     // Build a constant pointer to NewGV in the right address space.
     unsigned PtrAS = CE->getType()->getPointerAddressSpace();
@@ -508,8 +511,8 @@ static void applyFlattenAndPad(GlobalVariable *GV, int64_t L) {
     GV->eraseFromParent();
 
   errs() << "  [Transform] Flattened & padded: " << GV->getName() << " → size "
-         << FlatSize << " + " << FlatSize / L << " = " << PaddedSize
-         << " (L=" << L << ")\n";
+         << FlatSize << " + " << N << "*" << FlatSize / L << " = " << PaddedSize
+         << " (L=" << L << ", N=" << N << ")\n";
 }
 
 static int computeBankConflict(DimStrides S, int BlockDimX, int BlockDimY) {
@@ -544,7 +547,8 @@ static int computeBankConflict(DimStrides S, int BlockDimX, int BlockDimY) {
 //
 // Returns a double so the caller can compare fractional averages.
 static double computeBankConflictWithPadding(DimStrides S, int BlockDimX,
-                                             int BlockDimY, int64_t PaddingL) {
+                                             int BlockDimY, int64_t PaddingL,
+                                             int64_t PadN = 1) {
 
   // Dominant stride: prefer Tx, then Ty, then Tz.
   int64_t DomStride = (S.Tx != 0)   ? std::abs(S.Tx)
@@ -573,7 +577,7 @@ static double computeBankConflictWithPadding(DimStrides S, int BlockDimX,
       if (Seen.count(Logical))
         continue;
       Seen.insert(Logical);
-      int64_t Physical = Logical + Logical / PaddingL;
+      int64_t Physical = Logical + PadN * (Logical / PaddingL);
       // Correct modulo for negative numbers (though Logical should be
       // non-negative now)
       int Bank = (int)(((Physical % 32) + 32) % 32);
@@ -892,52 +896,81 @@ PreservedAnalyses SharedMemPass::run(Function &F, FunctionAnalysisManager &AM) {
           return (A / GCD(A, B)) * B;
         };
 
-        // Collect candidate L values from even strides that currently conflict.
-        std::set<int64_t> Candidates;
+        // Collect candidate (L, N) pairs from even strides that currently
+        // conflict.  For each stride, L = lcm(|S|, 32).
+        //
+        // N = ceil(32 / blockDim.x): the number of distinct threadY values
+        // within a single warp.  Each ty sub-group independently creates
+        // the same stride-S access pattern at a different base offset.
+        // Padding N per L ensures sufficient bank separation between all
+        // sub-groups.
+        //
+        // This formula requires blockDim.x to be a power of 2 (so it
+        // evenly divides 32 and all sub-groups have equal size).
+        // For non-power-of-2 blockDim.x, we fall back to N=1 (classic
+        // padding), which still partially resolves bank conflicts.
+        //
+        // Examples:
+        //   blockDim=(32,1) → N=1  (one sub-group, classic case)
+        //   blockDim=(16,16)→ N=2  (two ty values per warp)
+        //   blockDim=(8,4)  → N=4  (four ty values per warp)
+        bool IsPow2BDX = BlockDimX > 0 && (BlockDimX & (BlockDimX - 1)) == 0;
+        int64_t PadN = IsPow2BDX ? std::max<int64_t>(32 / BlockDimX, 1) : 1;
+        std::set<std::pair<int64_t, int64_t>> Candidates; // {L, N}
         for (auto &E : Entries) {
           int64_t AbsStride = std::abs(E.Stride);
           if (AbsStride <= 1 || AbsStride % 2 != 0)
             continue;
           int64_t IdealL = LCM(AbsStride, 32);
-          if (IdealL > 0)
-            Candidates.insert(IdealL);
+          if (IdealL <= 0)
+            continue;
+          Candidates.insert({IdealL, PadN});
         }
 
         if (Candidates.empty()) {
           errs() << "  [Padding] No conflicting even strides. No padding "
                     "needed.\n";
         } else {
-          // Evaluate each candidate L.
-          std::map<int64_t, double> ScoreMap;
-          for (int64_t L : Candidates) {
+          // Evaluate each candidate (L, N) across ALL accesses.
+          struct LNScore {
+            int64_t L;
+            int64_t N;
+            double Score;
+          };
+          std::vector<LNScore> Scores;
+          for (auto &[L, N] : Candidates) {
             double Score = 0.0;
             for (auto &E : Entries) {
               double W = (double)E.Weight / (double)TotalWeight;
               double After = computeBankConflictWithPadding(
-                  E.FullStrides, BlockDimX, BlockDimY, L);
+                  E.FullStrides, BlockDimX, BlockDimY, L, N);
               Score += W * ((double)E.ConflictBefore - After);
             }
-            ScoreMap[L] = Score;
-            errs() << "  [Padding] Candidate L=" << L
+            Scores.push_back({L, N, Score});
+            errs() << "  [Padding] Candidate L=" << L << " N=" << N
                    << " Score=" << format("%.4f", Score) << "\n";
           }
 
-          // Pick L with maximum score (must be > 0 to be beneficial).
-          int64_t BestL = 0;
+          // Pick (L, N) with maximum score (must be > 0 to be beneficial).
+          // Among equal scores, prefer smaller N (less memory overhead).
+          int64_t BestL = 0, BestN = 0;
           double BestScore = 0.0;
-          for (auto &[L, Score] : ScoreMap) {
-            if (Score > BestScore) {
-              BestScore = Score;
-              BestL = L;
+          for (auto &S : Scores) {
+            if (S.Score > BestScore ||
+                (S.Score == BestScore && S.N < BestN)) {
+              BestScore = S.Score;
+              BestL = S.L;
+              BestN = S.N;
             }
           }
           if (BestL > 0) {
             errs() << "  [Padding] >>> Recommended pad period: L=" << BestL
+                   << " N=" << BestN
                    << " (Score=" << format("%.4f", BestScore) << ")\n";
             // Apply the transformation: flatten the array and insert
-            // padded index = flat + flat/L for every GEP.
+            // padded index = flat + N * floor(flat/L) for every GEP.
             if (auto *GV = dyn_cast<GlobalVariable>(BaseVar)) {
-              applyFlattenAndPad(GV, BestL);
+              applyFlattenAndPad(GV, BestL, BestN);
               Modified = true;
             }
           } else {
