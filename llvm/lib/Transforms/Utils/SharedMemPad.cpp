@@ -57,6 +57,24 @@ static cl::opt<std::string> BlockDimFile(
 
 // If there are multiple strides for the shared memory variable SM
 // --> to be continued
+
+// File-scope helpers: gcd / lcm on int64_t.  Used by both the bank-conflict
+// simulator and the candidate-generation logic.
+static int64_t SMPGcd(int64_t A, int64_t B) {
+  A = std::abs(A);
+  B = std::abs(B);
+  while (B != 0) {
+    int64_t R = A % B;
+    A = B;
+    B = R;
+  }
+  return A;
+}
+static int64_t SMPLcm(int64_t A, int64_t B) {
+  if (A == 0 || B == 0)
+    return 0;
+  return (A / SMPGcd(A, B)) * B;
+}
 // guess 1: duplicate the shared memory variable?
 // guess 2: use loop iteration to determine solve which// Enums to define the
 // stride case
@@ -98,6 +116,7 @@ struct AccessInfo {
   StrideCase CaseType; // the classification
   uint64_t Weight;     // estimated access frequency
   int ConflictCount;   // estimated max bank conflict count
+  unsigned ElemBanks;  // number of 4-byte banks per element (1=float, 2=float2, 4=float4)
 };
 
 // Data structure to hold all accesses for a specific shared memory variable
@@ -515,23 +534,45 @@ static void applyFlattenAndPad(GlobalVariable *GV, int64_t L, int64_t N) {
          << " (L=" << L << ", N=" << N << ")\n";
 }
 
-static int computeBankConflict(DimStrides S, int BlockDimX, int BlockDimY) {
-  int Banks[32] = {0};
-  int MaxConflict = 0;
-  std::set<int64_t> Address;
-  for (int T = 0; T < 32; ++T) {
-    int ThreadX = T % BlockDimX;
-    int ThreadY = T / BlockDimX;
-    int64_t ElementIndex = ThreadX * S.Tx + ThreadY * S.Ty;
-    if (!Address.count(ElementIndex)) {
+// For wide accesses (>4B per thread), hardware splits a warp's request into
+// multiple phases.  Each phase serves up to 32 banks (128B):
+//   - float  (4B):  1 phase  of 32 threads, 1 bank/thread
+//   - float2 (8B):  2 phases of 16 threads, 2 banks/thread
+//   - float4 (16B): 4 phases of  8 threads, 4 banks/thread
+// Bank conflicts only occur **within a single phase**.  Conflicts across
+// phases do not serialize because they happen in different cycles.
+static int computeBankConflict(DimStrides S, int BlockDimX, int BlockDimY,
+                               int ElemBanks = 1) {
+  int ThreadsPerPhase = std::max(1, 32 / ElemBanks);
+  int NumPhases = ElemBanks;
+  int MaxConflictAcrossPhases = 0;
+
+  for (int P = 0; P < NumPhases; ++P) {
+    int Banks[32] = {0};
+    int MaxConflict = 0;
+    std::set<int64_t> Address;
+    for (int t = 0; t < ThreadsPerPhase; ++t) {
+      int T = P * ThreadsPerPhase + t; // lane id within the warp
+      int ThreadX = T % BlockDimX;
+      int ThreadY = T / BlockDimX;
+      int64_t ElementIndex = ThreadX * S.Tx + ThreadY * S.Ty;
+      if (Address.count(ElementIndex))
+        continue; // broadcast: same address served once, no conflict
       Address.insert(ElementIndex);
-      // Correct modulo for negative numbers: ((x % 32) + 32) % 32
-      int Bank = (int)(((ElementIndex % 32) + 32) % 32);
-      Banks[Bank]++;
-      MaxConflict = std::max(MaxConflict, Banks[Bank]);
+      // Each element occupies ElemBanks consecutive 4-byte banks.
+      // Count them all -- a phase has bank conflict iff any 4-byte bank is
+      // hit by more than one thread.
+      for (int b = 0; b < ElemBanks; ++b) {
+        int64_t BankUnit = ElementIndex * ElemBanks + b;
+        int Bank = (int)(((BankUnit % 32) + 32) % 32);
+        Banks[Bank]++;
+        MaxConflict = std::max(MaxConflict, Banks[Bank]);
+      }
     }
+    MaxConflictAcrossPhases =
+        std::max(MaxConflictAcrossPhases, MaxConflict);
   }
-  return MaxConflict;
+  return MaxConflictAcrossPhases;
 }
 
 // Compute average bank conflict across one full cycle of warps for stride S
@@ -541,14 +582,19 @@ static int computeBankConflict(DimStrides S, int BlockDimX, int BlockDimY) {
 // physical address of logical element i is:
 //   physical(i) = i + floor(i / L)
 //
-// We simulate lcm(32*|S|, L) / (32*|S|) warps -- the minimum number of warps
-// needed for the bank pattern to repeat -- and return the average per-warp
-// max-bank-conflict count.
+// We simulate `CycleWarps` warps -- the smallest W such that the floor()
+// term in `physical = logical + N*floor(logical/L)` advances by a constant
+// per warp.  After such W, every subsequent warp's bank pattern is just a
+// uniform shift of warp-0's pattern (same conflict count), so 1 cycle is
+// enough -- and for our standard candidates (L = lcm(S, 32/ElemBanks)) we
+// can prove L | 32*S, hence CycleWarps == 1 in practice.  The loop is kept
+// for robustness against non-standard L values.
 //
 // Returns a double so the caller can compare fractional averages.
 static double computeBankConflictWithPadding(DimStrides S, int BlockDimX,
                                              int BlockDimY, int64_t PaddingL,
-                                             int64_t PadN = 1) {
+                                             int64_t PadN = 1,
+                                             int ElemBanks = 1) {
 
   // Dominant stride: prefer Tx, then Ty, then Tz.
   int64_t DomStride = (S.Tx != 0)   ? std::abs(S.Tx)
@@ -557,34 +603,51 @@ static double computeBankConflictWithPadding(DimStrides S, int BlockDimX,
   if (DomStride == 0)
     return 1.0; // broadcast -- always 1 (no conflict)
 
-  // Cycle length in warps: one full padding period covers S*L logical elements.
-  // Each warp covers 32*S elements, so: (S*L) / (32*S) = L/32.
-  int64_t CycleWarps = PaddingL / 32;
+  // Cycle length in warps: smallest W such that L | W*32*|S|.
+  //   W = lcm(32*|S|, L) / (32*|S|) = L / gcd(L, 32*|S|)
+  // Examples:
+  //   float,  S=5, L=96  -> 96 / gcd(96,160) = 96/32  = 3  warps
+  //   float,  S=3, L=96  -> 96 / gcd(96, 96) = 96/96  = 1  warp
+  //   float4, S=4, L=8   -> 8  / gcd(8, 128) = 8/8    = 1  warp
+  // For standard candidates (L=lcm(S, 32/ElemBanks)) this is always 1 because
+  // L | 32*S; reduces to the classic L/32 whenever 32 | L (4-byte cases).
+  int64_t CycleWarps = std::max<int64_t>(
+      PaddingL / SMPGcd(PaddingL, 32 * DomStride), 1);
+
+  // Same phase-splitting model as computeBankConflict: a warp's wide access
+  // is served in `NumPhases` phases of `ThreadsPerPhase` threads each.
+  // Bank conflicts are only counted within a phase.
+  int ThreadsPerPhase = std::max(1, 32 / ElemBanks);
+  int NumPhases = ElemBanks;
 
   double TotalConflict = 0.0;
   for (int64_t W = 0; W < CycleWarps; ++W) {
-    int Banks[32] = {0};
-    int MaxConflict = 0;
-    std::set<int64_t> Seen;
-    for (int T = 0; T < 32; ++T) {
-      int ThreadX = T % BlockDimX;
-      int ThreadY = T / BlockDimX;
-      // Use absolute value of dominant stride for warp offset calculation,
-      // but preserve sign in thread-local calculation for correct relative
-      // positioning
-      int64_t Logical =
-          W * 32 * DomStride + std::abs(ThreadX * S.Tx + ThreadY * S.Ty);
-      if (Seen.count(Logical))
-        continue;
-      Seen.insert(Logical);
-      int64_t Physical = Logical + PadN * (Logical / PaddingL);
-      // Correct modulo for negative numbers (though Logical should be
-      // non-negative now)
-      int Bank = (int)(((Physical % 32) + 32) % 32);
-      Banks[Bank]++;
-      MaxConflict = std::max(MaxConflict, Banks[Bank]);
+    int WarpMaxConflict = 0;
+    for (int P = 0; P < NumPhases; ++P) {
+      int Banks[32] = {0};
+      int MaxConflict = 0;
+      std::set<int64_t> Seen;
+      for (int t = 0; t < ThreadsPerPhase; ++t) {
+        int T = P * ThreadsPerPhase + t;
+        int ThreadX = T % BlockDimX;
+        int ThreadY = T / BlockDimX;
+        int64_t Logical =
+            W * 32 * DomStride + std::abs(ThreadX * S.Tx + ThreadY * S.Ty);
+        if (Seen.count(Logical))
+          continue;
+        Seen.insert(Logical);
+        int64_t Physical = Logical + PadN * (Logical / PaddingL);
+        // Each element occupies ElemBanks consecutive banks.
+        for (int b = 0; b < ElemBanks; ++b) {
+          int64_t BankUnit = Physical * ElemBanks + b;
+          int Bank = (int)(((BankUnit % 32) + 32) % 32);
+          Banks[Bank]++;
+          MaxConflict = std::max(MaxConflict, Banks[Bank]);
+        }
+      }
+      WarpMaxConflict = std::max(WarpMaxConflict, MaxConflict);
     }
-    TotalConflict += MaxConflict;
+    TotalConflict += WarpMaxConflict;
   }
   return TotalConflict / (double)CycleWarps;
 }
@@ -713,6 +776,7 @@ PreservedAnalyses SharedMemPass::run(Function &F, FunctionAnalysisManager &AM) {
         DimStrides S = {0, 0, 0, true};
         StrideCase Case = StrideCase::UNKNOWN_CASE;
         int ConflictCount = 32;
+        unsigned ElemBanks = 1;
 
         if (TidValues.empty()) {
           // If the function doesn't even use thread IDs,
@@ -737,6 +801,9 @@ PreservedAnalyses SharedMemPass::run(Function &F, FunctionAnalysisManager &AM) {
                      : cast<StoreInst>(&I)->getValueOperand()->getType();
           const DataLayout &DL = F.getParent()->getDataLayout();
           unsigned ElementSizeBytes = DL.getTypeStoreSize(AccessType);
+          // Number of 4-byte banks occupied by one element
+          // (float=1, float2/double=2, float4=4)
+          ElemBanks = std::max(1u, ElementSizeBytes / 4u);
 
           // Use SCEV to calculate the stride
           const SCEV *Expr = SE.getSCEV(PtrOp);
@@ -759,7 +826,8 @@ PreservedAnalyses SharedMemPass::run(Function &F, FunctionAnalysisManager &AM) {
             } else {
               // For pure 1D access (only Tx), warp always fills X-dimension,
               // so BlockDimX=32 is safe even when blockDim is not known.
-              int MaxConflict = computeBankConflict(S, BlockDimX, BlockDimY);
+              int MaxConflict =
+                  computeBankConflict(S, BlockDimX, BlockDimY, ElemBanks);
               ConflictCount = MaxConflict;
 
               if (S.Tx == 0 && S.Ty == 0 && S.Tz == 0) {
@@ -781,7 +849,7 @@ PreservedAnalyses SharedMemPass::run(Function &F, FunctionAnalysisManager &AM) {
                               ? ProfileCount.value()
                               : BFI.getBlockFreq(I.getParent()).getFrequency();
 
-        AccessInfo Info = {&I, S, Case, Weight, ConflictCount};
+        AccessInfo Info = {&I, S, Case, Weight, ConflictCount, ElemBanks};
         SharedMemInfoMap[BaseVar].BaseVar = BaseVar;
         if (Case == StrideCase::UNKNOWN_CASE) {
           SharedMemInfoMap[BaseVar].HasUnknownAccess = true;
@@ -859,6 +927,7 @@ PreservedAnalyses SharedMemPass::run(Function &F, FunctionAnalysisManager &AM) {
         int ConflictBefore;
         uint64_t Weight;
         DimStrides FullStrides; // needed for 2D conflict recomputation
+        unsigned ElemBanks;     // banks per element (1=float, 2=float2, 4=float4)
       };
       std::vector<StrideEntry> Entries;
 
@@ -868,7 +937,8 @@ PreservedAnalyses SharedMemPass::run(Function &F, FunctionAnalysisManager &AM) {
           int64_t S = Acc.Strides.Tx != 0   ? Acc.Strides.Tx
                       : Acc.Strides.Ty != 0 ? Acc.Strides.Ty
                                             : Acc.Strides.Tz;
-          Entries.push_back({S, Acc.ConflictCount, Acc.Weight, Acc.Strides});
+          Entries.push_back(
+              {S, Acc.ConflictCount, Acc.Weight, Acc.Strides, Acc.ElemBanks});
         }
       };
       CollectEntries(Info.Loads);
@@ -881,23 +951,13 @@ PreservedAnalyses SharedMemPass::run(Function &F, FunctionAnalysisManager &AM) {
       if (TotalWeight == 0) {
         errs() << "  [Padding] No accesses found.\n";
       } else {
-        auto GCD = [](int64_t A, int64_t B) -> int64_t {
-          A = std::abs(A);
-          B = std::abs(B);
-          while (B) {
-            A %= B;
-            std::swap(A, B);
-          }
-          return A;
-        };
-        auto LCM = [&GCD](int64_t A, int64_t B) -> int64_t {
-          if (A == 0 || B == 0)
-            return 0;
-          return (A / GCD(A, B)) * B;
-        };
-
-        // Collect candidate (L, N) pairs from even strides that currently
-        // conflict.  For each stride, L = lcm(|S|, 32).
+        // Collect candidate (L, N) pairs from strides that currently
+        // have bank conflicts beyond the minimum for their element width.
+        // For each stride, L = lcm(|S|, 32/ElemBanks).
+        //
+        // ElemBanks = element_size / 4: how many 4-byte banks one element
+        // spans.  The effective number of distinct bank positions is
+        // 32/ElemBanks (e.g., 32 for float, 16 for float2, 8 for float4).
         //
         // N = ceil(32 / blockDim.x): the number of distinct threadY values
         // within a single warp.  Each ty sub-group independently creates
@@ -916,15 +976,56 @@ PreservedAnalyses SharedMemPass::run(Function &F, FunctionAnalysisManager &AM) {
         //   blockDim=(8,4)  → N=4  (four ty values per warp)
         bool IsPow2BDX = BlockDimX > 0 && (BlockDimX & (BlockDimX - 1)) == 0;
         int64_t PadN = IsPow2BDX ? std::max<int64_t>(32 / BlockDimX, 1) : 1;
-        std::set<std::pair<int64_t, int64_t>> Candidates; // {L, N}
+        // Each candidate is tagged with the ElemBanks of the access that
+        // produced it, because L/N are expressed in *that access type's*
+        // element units (e.g. float4 units when ElemBanks=4).  We need
+        // this later to convert L/N into the GV's ElemTy units.
+        std::set<std::tuple<int64_t, int64_t, unsigned>> Candidates;
         for (auto &E : Entries) {
           int64_t AbsStride = std::abs(E.Stride);
-          if (AbsStride <= 1 || AbsStride % 2 != 0)
+          // Skip if there is no bank conflict, or stride is 0 (broadcast).
+          // (The phase-splitting model already accounts for the fact that
+          // wide accesses can achieve 1-way -- e.g. float4 stride 1 -- so
+          // the floor is 1, not ElemBanks.)
+          if (AbsStride == 0 || E.ConflictBefore <= 1)
             continue;
-          int64_t IdealL = LCM(AbsStride, 32);
+          // L = lcm(|S|, 32/ElemBanks): period in elements before bank
+          // pattern repeats.  32/ElemBanks is the number of distinct bank
+          // positions available for this element width.
+          int64_t NumEffBanks = 32 / E.ElemBanks;
+          int64_t IdealL = SMPLcm(AbsStride, NumEffBanks);
           if (IdealL <= 0)
             continue;
-          Candidates.insert({IdealL, PadN});
+          Candidates.insert({IdealL, PadN, E.ElemBanks});
+        }
+
+        // Alignment filter: when the same shared variable is accessed by
+        // mixed widths (e.g. both float and float4), the padding inserted
+        // must be a multiple of the *largest* access size, otherwise the
+        // wider accesses would land on misaligned addresses after padding.
+        //
+        // Concretely, both L_bytes and N_bytes must be multiples of
+        // MaxAccessSize = MaxEB * 4.  Because L_bytes = L * EB * 4 and
+        // L is a multiple of 32/EB (by construction), L*EB is a multiple
+        // of 32, so L_bytes is always aligned.  Only N needs checking:
+        //   N_bytes = N * EB * 4  must be multiple of  MaxEB * 4
+        //   <=>  N * EB  must be multiple of  MaxEB
+        unsigned MaxEB = 1;
+        for (auto &E : Entries)
+          MaxEB = std::max(MaxEB, E.ElemBanks);
+        if (MaxEB > 1 && !Candidates.empty()) {
+          std::set<std::tuple<int64_t, int64_t, unsigned>> Filtered;
+          for (auto &[L, N, EB] : Candidates) {
+            if ((N * (int64_t)EB) % (int64_t)MaxEB == 0) {
+              Filtered.insert({L, N, EB});
+            } else {
+              errs() << "  [Padding] Drop candidate (L=" << L << ",N=" << N
+                     << ",EB=" << EB << "): N_bytes=" << (N * EB * 4)
+                     << " not aligned to max access size " << (MaxEB * 4)
+                     << "B\n";
+            }
+          }
+          Candidates = std::move(Filtered);
         }
 
         if (Candidates.empty()) {
@@ -935,25 +1036,39 @@ PreservedAnalyses SharedMemPass::run(Function &F, FunctionAnalysisManager &AM) {
           struct LNScore {
             int64_t L;
             int64_t N;
+            unsigned ElemBanks; // units that L/N are expressed in
             double Score;
           };
           std::vector<LNScore> Scores;
-          for (auto &[L, N] : Candidates) {
+          for (auto &[L, N, EB] : Candidates) {
             double Score = 0.0;
             for (auto &E : Entries) {
               double W = (double)E.Weight / (double)TotalWeight;
+              // Convert (L, N) from "EB element" units to "E.ElemBanks
+              // element" units, so the simulator sees them in the same
+              // unit as E.FullStrides.
+              //   L_bytes      = L * EB * 4
+              //   L_in_E_units = L_bytes / (E.ElemBanks * 4)
+              //                = L * EB / E.ElemBanks
+              // For our standard candidates L is a multiple of 32/EB, so
+              // L*EB is a multiple of 32 and divisible by any
+              // E.ElemBanks in {1,2,4} -> exact integer.
+              int64_t LE = L * (int64_t)EB / (int64_t)E.ElemBanks;
+              int64_t NE = N * (int64_t)EB / (int64_t)E.ElemBanks;
               double After = computeBankConflictWithPadding(
-                  E.FullStrides, BlockDimX, BlockDimY, L, N);
+                  E.FullStrides, BlockDimX, BlockDimY, LE, NE, E.ElemBanks);
               Score += W * ((double)E.ConflictBefore - After);
             }
-            Scores.push_back({L, N, Score});
+            Scores.push_back({L, N, EB, Score});
             errs() << "  [Padding] Candidate L=" << L << " N=" << N
+                   << " (units=" << (EB * 4) << "B)"
                    << " Score=" << format("%.4f", Score) << "\n";
           }
 
           // Pick (L, N) with maximum score (must be > 0 to be beneficial).
           // Among equal scores, prefer smaller N (less memory overhead).
           int64_t BestL = 0, BestN = 0;
+          unsigned BestElemBanks = 1;
           double BestScore = 0.0;
           for (auto &S : Scores) {
             if (S.Score > BestScore ||
@@ -961,16 +1076,37 @@ PreservedAnalyses SharedMemPass::run(Function &F, FunctionAnalysisManager &AM) {
               BestScore = S.Score;
               BestL = S.L;
               BestN = S.N;
+              BestElemBanks = S.ElemBanks;
             }
           }
           if (BestL > 0) {
-            errs() << "  [Padding] >>> Recommended pad period: L=" << BestL
-                   << " N=" << BestN
-                   << " (Score=" << format("%.4f", BestScore) << ")\n";
-            // Apply the transformation: flatten the array and insert
-            // padded index = flat + N * floor(flat/L) for every GEP.
+            // L and N are in "access type" units (e.g. float4 if
+            // BestElemBanks=4).  applyFlattenAndPad operates in the GV's
+            // innermost ElemTy units.  Convert via the byte ratio:
+            //   Scale = AccessSizeBytes / ElemTySizeBytes
+            //         = (BestElemBanks * 4) / ElemTySize
+            // Examples:
+            //   GV=float[],  access=float4  -> Scale = 16/4 = 4
+            //   GV=float4[], access=float4  -> Scale = 16/16 = 1
+            //   GV=float[],  access=float   -> Scale =  4/4 = 1
             if (auto *GV = dyn_cast<GlobalVariable>(BaseVar)) {
-              applyFlattenAndPad(GV, BestL, BestN);
+              const DataLayout &DL = F.getParent()->getDataLayout();
+              Type *ElemTy = GV->getValueType();
+              while (auto *AT = dyn_cast<ArrayType>(ElemTy))
+                ElemTy = AT->getElementType();
+              uint64_t ElemTySize = DL.getTypeStoreSize(ElemTy);
+              uint64_t AccessSize = (uint64_t)BestElemBanks * 4u;
+              int64_t Scale = (ElemTySize > 0 && AccessSize >= ElemTySize)
+                                  ? (int64_t)(AccessSize / ElemTySize)
+                                  : 1;
+              int64_t ScaledL = BestL * Scale;
+              int64_t ScaledN = BestN * Scale;
+              errs() << "  [Padding] >>> Recommended pad period: L=" << BestL
+                     << " N=" << BestN << " (access units, " << AccessSize
+                     << "B); applying L=" << ScaledL << " N=" << ScaledN
+                     << " in ElemTy units (" << ElemTySize << "B)"
+                     << " Score=" << format("%.4f", BestScore) << "\n";
+              applyFlattenAndPad(GV, ScaledL, ScaledN);
               Modified = true;
             }
           } else {
