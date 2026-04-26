@@ -19,6 +19,7 @@
 #include "llvm/IR/Instructions.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/Format.h"
+#include "llvm/Support/MathExtras.h"
 
 #include <cstdint>
 #include <functional>
@@ -427,8 +428,13 @@ static void applyFlattenAndPad(GlobalVariable *GV, int64_t L, int64_t N) {
       }
     }
 
-    // Apply padding: padded = flat + N * udiv(flat, L).
-    Value *Pad = B.CreateUDiv(FlatIdx, ConstantInt::get(I64Ty, L), "pad");
+    // Apply padding: padded = flat + N * (flat / L).
+    // When L is a power of two, lower the udiv to a logical right shift.
+    Value *Pad;
+    if (isPowerOf2_64(L))
+      Pad = B.CreateLShr(FlatIdx, ConstantInt::get(I64Ty, Log2_64(L)), "pad");
+    else
+      Pad = B.CreateUDiv(FlatIdx, ConstantInt::get(I64Ty, L), "pad");
     Value *ScaledPad = (N == 1) ? Pad
                                 : B.CreateMul(Pad, ConstantInt::get(I64Ty, N),
                                               "scaled.pad");
