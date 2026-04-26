@@ -1,0 +1,32 @@
+[
+  {
+    "Stub": "test_scalar_stride2",
+    "BlockDim": {"X": 32, "Y": 1, "Z": 1},
+    "GridDim": {"X": 1, "Y": 1, "Z": 1}
+  },
+  {
+    "Stub": "test_float4_stride1",
+    "BlockDim": {"X": 32, "Y": 1, "Z": 1},
+    "GridDim": {"X": 1, "Y": 1, "Z": 1}
+  },
+  {
+    "Stub": "test_float4_stride2",
+    "BlockDim": {"X": 32, "Y": 1, "Z": 1},
+    "GridDim": {"X": 1, "Y": 1, "Z": 1}
+  },
+  {
+    "Stub": "test_float2_stride1",
+    "BlockDim": {"X": 32, "Y": 1, "Z": 1},
+    "GridDim": {"X": 1, "Y": 1, "Z": 1}
+  },
+  {
+    "Stub": "test_float2_stride2",
+    "BlockDim": {"X": 32, "Y": 1, "Z": 1},
+    "GridDim": {"X": 1, "Y": 1, "Z": 1}
+  },
+  {
+    "Stub": "test_mixed_alignment",
+    "BlockDim": {"X": 32, "Y": 1, "Z": 1},
+    "GridDim": {"X": 1, "Y": 1, "Z": 1}
+  }
+]
