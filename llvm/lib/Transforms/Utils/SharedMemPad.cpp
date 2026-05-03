@@ -1003,6 +1003,45 @@ PreservedAnalyses SharedMemPass::run(Function &F, FunctionAnalysisManager &AM) {
           if (IdealL <= 0)
             continue;
           Candidates.insert({IdealL, PadN, E.ElemBanks});
+
+          // ---------------------------------------------------------------
+          // Extra candidates for 2D row-major access patterns.
+          //
+          // Picking only the "dominant stride" loses information when both
+          // Tx and Ty are non-zero.  For the two canonical patterns:
+          //
+          //   arr[ty][tx]:  Cx = 1, Cy = W   -> L = W,  N = bx
+          //   arr[tx][ty]:  Cx = W, Cy = 1   -> L = W,  N = (32/EB)/bx
+          //
+          // where W is the innermost array-dim size (= row pitch in
+          // access-type elements).  These are added on top of the dominant-
+          // stride candidate; the cost model below will discard them if
+          // they do not actually reduce conflicts.
+          //
+          // Assumptions for the formulas to be optimal:
+          //   * bx divides 32/EB
+          //   * W is a multiple of 32/EB    (true for typical 32-wide tiles)
+          //   * No mixed coefficients (pure Cx*tx + Cy*ty)
+          // When the assumptions break, the cost model still acts as a
+          // safety net and the candidate is simply ignored.
+          // ---------------------------------------------------------------
+          int64_t TxA = std::abs(E.FullStrides.Tx);
+          int64_t TyA = std::abs(E.FullStrides.Ty);
+          // arr[ty][tx]: row pitch W = |Ty|, shift each ty-subgroup by bx.
+          if (TxA == 1 && TyA > 1 && BlockDimX > 0 &&
+              (int64_t)BlockDimX < NumEffBanks) {
+            int64_t LTT = TyA;
+            int64_t NTT = BlockDimX;
+            if (NTT > 0 && NTT < LTT)
+              Candidates.insert({LTT, NTT, E.ElemBanks});
+          }
+          // arr[tx][ty]: row pitch W = |Tx|, shift each tx-subgroup by Q.
+          if (TyA == 1 && TxA > 1 && BlockDimX > 0 && IsPow2BDX) {
+            int64_t LTT = TxA;
+            int64_t Q = std::max<int64_t>(NumEffBanks / BlockDimX, 1);
+            if (Q > 0 && Q < LTT)
+              Candidates.insert({LTT, Q, E.ElemBanks});
+          }
         }
 
         // Alignment filter: when the same shared variable is accessed by
