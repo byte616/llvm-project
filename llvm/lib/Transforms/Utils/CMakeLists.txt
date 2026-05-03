@@ -72,6 +72,8 @@ add_llvm_component_library(LLVMTransformUtils
   RelLookupTableConverter.cpp
   ScalarEvolutionExpander.cpp
   SCCPSolver.cpp
+  BlockGridDimensionAnalysis.cpp
+  SharedMemPad.cpp
   StripGCRelocates.cpp
   SSAUpdater.cpp
   SSAUpdaterBulk.cpp
