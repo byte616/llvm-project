@@ -28,5 +28,15 @@
     "Stub": "test_mixed_alignment",
     "BlockDim": {"X": 32, "Y": 1, "Z": 1},
     "GridDim": {"X": 1, "Y": 1, "Z": 1}
+  },
+  {
+    "Stub": "test_flat_iv_in_loop",
+    "BlockDim": {"X": 32, "Y": 1, "Z": 1},
+    "GridDim": {"X": 1, "Y": 1, "Z": 1}
+  },
+  {
+    "Stub": "test_flat_iv_no_loop",
+    "BlockDim": {"X": 32, "Y": 1, "Z": 1},
+    "GridDim": {"X": 1, "Y": 1, "Z": 1}
   }
 ]

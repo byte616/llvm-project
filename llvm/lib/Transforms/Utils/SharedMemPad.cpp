@@ -9,9 +9,12 @@
 
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Analysis/BlockFrequencyInfo.h"
+#include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/Analysis/ScalarEvolutionExpressions.h"
 #include "llvm/Analysis/ValueTracking.h"
+#include "llvm/Transforms/Utils/Local.h"
+#include "llvm/Transforms/Utils/ScalarEvolutionExpander.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/GlobalVariable.h"
@@ -281,7 +284,9 @@ static SmallVector<int64_t, 4> computeDimStrides(Type *SrcTy) {
 // This walk covers unrolled GEPs automatically because every unrolled
 // iteration produces an independent GEP instruction, all of them users
 // of the same GlobalVariable (possibly through an addrspacecast CE).
-static void applyFlattenAndPad(GlobalVariable *GV, int64_t L, int64_t N) {
+static void applyFlattenAndPad(GlobalVariable *GV, int64_t L, int64_t N,
+                               LoopInfo *LI = nullptr,
+                               ScalarEvolution *SE = nullptr) {
   Module *M = GV->getParent();
   LLVMContext &Ctx = M->getContext();
   Type *I64Ty = Type::getInt64Ty(Ctx);
@@ -385,6 +390,22 @@ static void applyFlattenAndPad(GlobalVariable *GV, int64_t L, int64_t N) {
   };
 
   // 4a. Transform each GEP instruction.
+  // One SCEVExpander shared across all GEPs so that phi nodes created for
+  // the first GEP can be reused by subsequent GEPs whose SCEVs match or are
+  // constant offsets of one another.  This avoids creating a separate IV
+  // per unrolled copy of an access.
+  std::unique_ptr<SCEVExpander> SharedExp;
+  if (LI && SE) {
+    SharedExp = std::make_unique<SCEVExpander>(*SE, M->getDataLayout(),
+                                               "flat.iv");
+    SharedExp->disableCanonicalMode();
+  }
+  // Cache of (SCEV of already-materialized FlatIdx, materialized Value).
+  // Used to coalesce unrolled copies: if a later GEP's SCEV differs from
+  // a cached one only by a loop-invariant constant, reuse the base and
+  // add the constant offset instead of creating a new phi.
+  SmallVector<std::pair<const SCEV *, Value *>, 8> FlatIVCache;
+
   for (auto *GEP : GEPsToReplace) {
     IRBuilder<> B(GEP);
     Type *GEPSrcTy = GEP->getSourceElementType();
@@ -400,9 +421,15 @@ static void applyFlattenAndPad(GlobalVariable *GV, int64_t L, int64_t N) {
         else
           ByteOff = B.CreateSExt(ByteOff, I64Ty, "byteoff.ext");
       }
-      // Convert byte offset to element index
-      FlatIdx =
-          B.CreateSDiv(ByteOff, ConstantInt::get(I64Ty, ElemSize), "elem.idx");
+      // Convert byte offset to element index.
+      // When ElemSize is a power of two, lower the sdiv to an arithmetic
+      // right shift (byte offsets from valid GEPs are exactly divisible).
+      if (isPowerOf2_64(ElemSize))
+        FlatIdx = B.CreateAShr(
+            ByteOff, ConstantInt::get(I64Ty, Log2_64(ElemSize)), "elem.idx");
+      else
+        FlatIdx = B.CreateSDiv(ByteOff, ConstantInt::get(I64Ty, ElemSize),
+                               "elem.idx");
     } else {
       // Element form: getelementptr [AxB], ptr, 0, row, col, ...
       SmallVector<int64_t, 4> Strides = computeDimStrides(GEPSrcTy);
@@ -422,9 +449,131 @@ static void applyFlattenAndPad(GlobalVariable *GV, int64_t L, int64_t N) {
         }
         // Strides[i-1]: stride for the i-th non-leading index.
         int64_t Stride = (i - 1 < Strides.size()) ? Strides[i - 1] : 1;
-        FlatIdx = B.CreateAdd(
-            FlatIdx, B.CreateMul(Idx, ConstantInt::get(I64Ty, Stride), "fmul"),
-            "flat");
+        // Strength-reduce: stride==1 -> no mul, power-of-two -> shl.
+        Value *Term;
+        if (Stride == 1)
+          Term = Idx;
+        else if (isPowerOf2_64(Stride))
+          Term = B.CreateShl(Idx, ConstantInt::get(I64Ty, Log2_64(Stride)),
+                             "fmul");
+        else
+          Term = B.CreateMul(Idx, ConstantInt::get(I64Ty, Stride), "fmul");
+        FlatIdx = B.CreateAdd(FlatIdx, Term, "flat");
+      }
+    }
+
+    // Try to rewrite FlatIdx into a phi-based induction-variable form when
+    // it is an affine recurrence in some enclosing loop. This makes the
+    // downstream pad arithmetic (and the entire address) follow an IV
+    // increment pattern, which significantly reduces per-iteration work
+    // (LSR/IndVars usually do not turn the closed form into an IV on their
+    // own).  Fallback: keep the current closed-form FlatIdx.
+    if (SharedExp) {
+      if (auto *FlatInst = dyn_cast<Instruction>(FlatIdx)) {
+        if (Loop *Lp = LI->getLoopFor(FlatInst->getParent())) {
+          if (Lp->getLoopPreheader()) {
+            const SCEV *S = SE->getSCEV(FlatInst);
+            if (S && !isa<SCEVCouldNotCompute>(S) &&
+                SE->containsAddRecurrence(S)) {
+              // Look for an already-expanded SCEV in the same loop whose
+              // difference from S is a loop-invariant integer constant.
+              // If found, reuse its phi and add the constant offset so
+              // unrolled copies of the same access share ONE induction
+              // variable instead of creating N parallel phis.
+              //
+              // Canonical-base policy: keep the SCEV with the *smallest*
+              // start as the materialized phi.  This ensures the most
+              // common k=0 unroll copy (which usually appears in the main
+              // body block) uses the phi directly with no offset add,
+              // while k=1..N copies pay a single positive add.  If we
+              // discover a smaller start later, we *swap*: re-materialize
+              // the new canonical and rewrite the old base's existing
+              // uses through `new_base + |diff|`.
+              Value *NewFlat = nullptr;
+              auto *SAR = dyn_cast<SCEVAddRecExpr>(S);
+              for (size_t i = 0; i < FlatIVCache.size(); ++i) {
+                const SCEV *Cached = FlatIVCache[i].first;
+                Value *CachedBase = FlatIVCache[i].second;
+                auto *CachedAR = dyn_cast<SCEVAddRecExpr>(Cached);
+                if (!CachedAR || !SAR ||
+                    CachedAR->getLoop() != SAR->getLoop())
+                  continue;
+                const SCEV *Diff = SE->getMinusSCEV(S, Cached);
+                auto *C = dyn_cast<SCEVConstant>(Diff);
+                if (!C)
+                  continue;
+                const APInt &D = C->getAPInt();
+                if (D == 0) {
+                  NewFlat = CachedBase;
+                } else if (D.isNonNegative()) {
+                  // S = Cached + D (D > 0).  Derive directly.
+                  IRBuilder<> BB(FlatInst);
+                  NewFlat = BB.CreateAdd(
+                      CachedBase, ConstantInt::get(I64Ty, D), "flat.iv.off");
+                } else {
+                  // S < Cached.  Make S the new canonical.
+                  // 1) Materialize NewBase from S.
+                  // 2) Replace the cached base's uses with `NewBase + |D|`.
+                  // 3) Update the cache entry to (S, NewBase).
+                  Value *NewBase = SharedExp->expandCodeFor(
+                      S, I64Ty, &*Lp->getHeader()->getFirstInsertionPt());
+                  if (auto *CBInst = dyn_cast<Instruction>(CachedBase)) {
+                    // Insert the replacement after CBInst (or at the
+                    // start of the loop body if CBInst is the loop-
+                    // header phi).  Do NOT delete CBInst: SCEVExpander
+                    // holds AssertingVHs to materialized values and
+                    // would assert on deletion.  Downstream DCE will
+                    // remove it once it is truly dead.
+                    Instruction *InsertPt =
+                        isa<PHINode>(CBInst)
+                            ? &*CBInst->getParent()->getFirstInsertionPt()
+                            : CBInst->getNextNode();
+                    IRBuilder<> BB(InsertPt);
+                    Value *Replacement = BB.CreateAdd(
+                        NewBase, ConstantInt::get(I64Ty, -D),
+                        "flat.iv.off");
+                    CBInst->replaceUsesWithIf(
+                        Replacement, [&](Use &U) {
+                          return U.getUser() != Replacement;
+                        });
+                  }
+                  FlatIVCache[i] = {S, NewBase};
+                  NewFlat = NewBase;
+                }
+                break;
+              }
+              if (!NewFlat)
+                NewFlat = SharedExp->expandCodeFor(S, I64Ty, FlatInst);
+              if (NewFlat && NewFlat != FlatInst) {
+                FlatInst->replaceAllUsesWith(NewFlat);
+                RecursivelyDeleteTriviallyDeadInstructions(FlatInst);
+                FlatIdx = NewFlat;
+                // Reset the IRBuilder insert point, since FlatInst is gone.
+                B.SetInsertPoint(GEP);
+              }
+              if (NewFlat) {
+                // Only push if we either (a) created a fresh phi, or
+                // (b) swapped to a new canonical.  In the constant-offset
+                // derive case NewFlat is the offset add, not the base, so
+                // we don't add it to the cache to avoid stacking offsets.
+                bool IsBase = false;
+                if (auto *Phi = dyn_cast<PHINode>(NewFlat))
+                  IsBase = (LI->getLoopFor(Phi->getParent()) == SAR->getLoop());
+                if (IsBase) {
+                  // Ensure not already present.
+                  bool Found = false;
+                  for (auto &KV : FlatIVCache)
+                    if (KV.second == NewFlat) {
+                      Found = true;
+                      break;
+                    }
+                  if (!Found)
+                    FlatIVCache.push_back({S, NewFlat});
+                }
+              }
+            }
+          }
+        }
       }
     }
 
@@ -435,9 +584,15 @@ static void applyFlattenAndPad(GlobalVariable *GV, int64_t L, int64_t N) {
       Pad = B.CreateLShr(FlatIdx, ConstantInt::get(I64Ty, Log2_64(L)), "pad");
     else
       Pad = B.CreateUDiv(FlatIdx, ConstantInt::get(I64Ty, L), "pad");
-    Value *ScaledPad = (N == 1) ? Pad
-                                : B.CreateMul(Pad, ConstantInt::get(I64Ty, N),
-                                              "scaled.pad");
+    // When N is a power of two, lower the mul to a logical left shift.
+    Value *ScaledPad;
+    if (N == 1)
+      ScaledPad = Pad;
+    else if (isPowerOf2_64(N))
+      ScaledPad =
+          B.CreateShl(Pad, ConstantInt::get(I64Ty, Log2_64(N)), "scaled.pad");
+    else
+      ScaledPad = B.CreateMul(Pad, ConstantInt::get(I64Ty, N), "scaled.pad");
     Value *PaddedIdx = B.CreateAdd(FlatIdx, ScaledPad, "padded");
 
     // Build a pointer to the new global in the right address space.
@@ -1151,7 +1306,9 @@ PreservedAnalyses SharedMemPass::run(Function &F, FunctionAnalysisManager &AM) {
                      << "B); applying L=" << ScaledL << " N=" << ScaledN
                      << " in ElemTy units (" << ElemTySize << "B)"
                      << " Score=" << format("%.4f", BestScore) << "\n";
-              applyFlattenAndPad(GV, ScaledL, ScaledN);
+              auto &LI = AM.getResult<LoopAnalysis>(F);
+              auto &SE = AM.getResult<ScalarEvolutionAnalysis>(F);
+              applyFlattenAndPad(GV, ScaledL, ScaledN, &LI, &SE);
               Modified = true;
             }
           } else {
