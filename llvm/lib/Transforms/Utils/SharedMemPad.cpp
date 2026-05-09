@@ -321,7 +321,12 @@ static void applyFlattenAndPad(GlobalVariable *GV, int64_t L, int64_t N,
   SmallVector<ConstantExpr *, 16> CEGEPsToReplace;
   SmallVector<Instruction *, 8> DirectAccessesToReplace; // Load/Store to base
 
-  std::function<void(Value *)> Collect = [&](Value *V) {
+  // ThroughGEP: If the call chain has passed through any GEP (instruction or ConstantExpr),
+  // then the Load/Store on that chain should not be treated as a direct base-pointer access
+  // and must not be added to DirectAccessesToReplace;
+  // otherwise, the padded-index pointer already produced by the GEP would be overwritten
+  // with a flat-index-0 pointer.
+  std::function<void(Value *, bool)> Collect = [&](Value *V, bool ThroughGEP) {
     for (User *U : V->users()) {
       if (auto *GEP = dyn_cast<GetElementPtrInst>(U)) {
         GEPsToReplace.push_back(GEP);
@@ -329,21 +334,26 @@ static void applyFlattenAndPad(GlobalVariable *GV, int64_t L, int64_t N,
         if (CE->getOpcode() == Instruction::GetElementPtr) {
           // CE is itself a GEP — collect it for constant-folded replacement.
           CEGEPsToReplace.push_back(CE);
+          // Recurse *through the GEP*: downstream load/stores reached via
+          // this CE GEP must not be treated as direct base accesses.
+          Collect(CE, /*ThroughGEP=*/true);
+        } else {
+          // Non-GEP CE (addrspacecast, bitcast): pass-through.
+          Collect(CE, ThroughGEP);
         }
-        // Always recurse: downstream GEP *instructions* may use this CE
-        // as their pointer operand (e.g. CE GEP → GEP instruction chain).
-        Collect(CE);
       } else if (auto *Cast = dyn_cast<AddrSpaceCastInst>(U)) {
-        Collect(Cast);
+        Collect(Cast, ThroughGEP);
       } else if (auto *Cast = dyn_cast<BitCastInst>(U)) {
-        Collect(Cast);
+        Collect(Cast, ThroughGEP);
       } else if (auto *LI = dyn_cast<LoadInst>(U)) {
-        // Direct load from base pointer (flat index 0)
-        DirectAccessesToReplace.push_back(LI);
+        // Only a direct base-pointer load (flat index 0) if no GEP in chain.
+        if (!ThroughGEP)
+          DirectAccessesToReplace.push_back(LI);
       } else if (auto *SI = dyn_cast<StoreInst>(U)) {
-        // Direct store to base pointer (flat index 0)
-        // Make sure V is the pointer operand, not the value being stored
-        if (SI->getPointerOperand() == V) {
+        // Direct store to base pointer (flat index 0).
+        // Require: (a) V is the pointer operand (not the stored value), and
+        // (b) no GEP in the chain.
+        if (!ThroughGEP && SI->getPointerOperand() == V) {
           DirectAccessesToReplace.push_back(SI);
         }
       }
@@ -351,7 +361,7 @@ static void applyFlattenAndPad(GlobalVariable *GV, int64_t L, int64_t N,
       // more complex analysis to track all incoming values.
     }
   };
-  Collect(GV);
+  Collect(GV, /*ThroughGEP=*/false);
 
   // Helper: given a CE GEP, return the flat element index as a constant.
   //   Two forms are handled:
