@@ -7,6 +7,7 @@
 #include "llvm/TargetParser/Triple.h"
 #include "llvm/Transforms/Utils/BlockGridDimensionAnalysis.h"
 
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Analysis/BlockFrequencyInfo.h"
 #include "llvm/Analysis/LoopInfo.h"
@@ -27,6 +28,7 @@
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <numeric>
 #include <set>
 #include <vector>
 
@@ -155,7 +157,180 @@ public:
     return Res;
   }
 
+  // Peel off any number of zero/sign-extend wrappers, returning the
+  // innermost SCEV.  Used by the div/rem fold so that the matcher works
+  // even when the address arithmetic widens `x` to i64 (sext/zext gets
+  // pushed inside udiv/and by SCEV in some configurations).
+  static const SCEV *peelExtensions(const SCEV *S) {
+    while (true) {
+      if (auto *ZE = dyn_cast<SCEVZeroExtendExpr>(S))
+        S = ZE->getOperand();
+      else if (auto *SX = dyn_cast<SCEVSignExtendExpr>(S))
+        S = SX->getOperand();
+      else if (auto *TR = dyn_cast<SCEVTruncateExpr>(S))
+        S = TR->getOperand();
+      else
+        break;
+    }
+    return S;
+  }
+
+  // Match S == K * (A udiv C) with K, C positive constants.
+  // K==1 case: S itself is the SCEVUDivExpr (no enclosing Mul).
+  // Looks through zext/sext/trunc wrappers on the Mul operands so that
+  // the inner UDivExpr is found regardless of any bitwidth normalization
+  // SCEV performed when widening to pointer size.
+  static bool matchKMulUDiv(const SCEV *S, int64_t &K, int64_t &C,
+                            const SCEV *&A) {
+    S = peelExtensions(S);
+    if (auto *UD = dyn_cast<SCEVUDivExpr>(S)) {
+      auto *DivC = dyn_cast<SCEVConstant>(UD->getRHS());
+      if (!DivC) return false;
+      K = 1;
+      C = DivC->getAPInt().getSExtValue();
+      A = UD->getLHS();
+      return C > 0;
+    }
+    auto *M = dyn_cast<SCEVMulExpr>(S);
+    if (!M) return false;
+    const SCEVConstant *KC = nullptr;
+    const SCEVUDivExpr *UD = nullptr;
+    for (const SCEV *Op : M->operands()) {
+      const SCEV *PO = peelExtensions(Op);
+      if (auto *C2 = dyn_cast<SCEVConstant>(PO)) {
+        if (KC) return false;
+        KC = C2;
+      } else if (auto *U = dyn_cast<SCEVUDivExpr>(PO)) {
+        if (UD) return false;
+        UD = U;
+      } else {
+        return false;
+      }
+    }
+    if (!KC || !UD) return false;
+    auto *DivC = dyn_cast<SCEVConstant>(UD->getRHS());
+    if (!DivC) return false;
+    K = KC->getAPInt().getSExtValue();
+    C = DivC->getAPInt().getSExtValue();
+    A = UD->getLHS();
+    return K > 0 && C > 0;
+  }
+
   DimStrides visitAddExpr(const SCEVAddExpr *Expr) {
+    // ----- Pre-pass: collapse the GEP idiom `arr[x / C][x % C]` -----
+    //
+    // For typical 2-D shared accesses such as
+    //     __shared__ float arr[H][C];
+    //     int x = stride * tid;
+    //     ... = arr[x / C][x % C];
+    // the address SCEV produced by GEP is
+    //     base + K1 * (A udiv C) + RemTerm
+    // where K1 is the row pitch in bytes and RemTerm represents
+    // `K2 * (A urem C)` in some form — most commonly an opaque
+    //     K2 * SCEVUnknown(and A, C-1)                   (post-InstCombine),
+    // or, after SCEV's own canonicalization of bit-mask `and`,
+    //     K2 * SCEVZeroExtend(SCEVTruncate(...)).
+    //
+    // The relation K1 = K2 * C makes the whole thing equal to
+    //     base + K2 * A.
+    //
+    // We recognise the pair by *constructing* the canonical rem term via
+    // SCEV's `getURemExpr` and letting SCEV's value-numbering tell us
+    // whether that exact SCEV node is already an operand of the AddExpr.
+    // Because SCEV uniques nodes, both forms (rem-from-and-IR and
+    // rem-from-getURemExpr) collapse to the same pointer when they are
+    // mathematically identical, so a pointer-equal lookup suffices.
+    for (unsigned i = 0; i < Expr->getNumOperands(); ++i) {
+      const SCEV *Opi = Expr->getOperand(i);
+      int64_t K1 = 0, C = 0;
+      const SCEV *A = nullptr;
+      if (!matchKMulUDiv(Opi, K1, C, A)) continue;
+      if (C <= 0 || K1 % C != 0) continue;
+      int64_t K2 = K1 / C;
+      // Build the canonical K2 * urem(A, C) plus all gcd-factored
+      // variants and look for any of them among the remaining operands.
+      //
+      // SCEV uniques nodes by structure, so a pointer comparison only
+      // succeeds when the candidate has the exact same shape as what
+      // SCEV used when first constructing the AddExpr.  Two equivalent
+      // shapes show up in practice:
+      //   1. The canonical urem form, produced by SCEV when it
+      //      processes an `and X, 2^k-1` IR instruction (or an `urem`
+      //      directly): `K2 * zext_ik(c * trunc_ik(B))` with k=log2(C).
+      //   2. A gcd-factored form, produced when InstCombine has
+      //      narrowed the mask to `and X, M` with M = (2^k-1) & ~low,
+      //      because the low bits of X are known zero (e.g. clang turns
+      //      `(6*tid) & 31` into `(6*tid) & 30` since 6 is even).  SCEV
+      //      then represents the rem as
+      //          (K2*g) * zext_ij((c/g) * trunc_ij(B))
+      //      with g = gcd(c, C), j = log2(C/g), C/g a power of two.
+      //
+      // We enumerate divisors of gcd(LinCoef, C) so that at least one
+      // candidate matches whichever shape SCEV picked.
+      auto BuildExpected = [&](const SCEV *RemA,
+                               int64_t RemC) -> const SCEV * {
+        const SCEV *URem =
+            SE.getURemExpr(RemA, SE.getConstant(RemA->getType(), RemC));
+        int64_t Scale = K1 / RemC; // K2 * (C / RemC)
+        return Scale == 1
+                   ? URem
+                   : SE.getMulExpr(SE.getConstant(RemA->getType(), Scale),
+                                   URem);
+      };
+
+      SmallVector<const SCEV *, 4> Candidates;
+      Candidates.push_back(BuildExpected(A, C));
+
+      // Try gcd-factored variants when A is a constant-times-rest mul.
+      if (auto *AM = dyn_cast<SCEVMulExpr>(A)) {
+        if (auto *CC = dyn_cast<SCEVConstant>(AM->getOperand(0))) {
+          int64_t LinCoef = CC->getAPInt().getSExtValue();
+          if (LinCoef > 0) {
+            int64_t G = std::gcd<int64_t>(std::abs(LinCoef), C);
+            for (int64_t Div = 2; Div <= G; ++Div) {
+              if (G % Div != 0) continue;
+              if (LinCoef % Div != 0 || C % Div != 0) continue;
+              // Build A' = (LinCoef/Div) * rest, C' = C/Div.
+              SmallVector<const SCEV *, 4> RestOps;
+              RestOps.push_back(
+                  SE.getConstant(A->getType(), LinCoef / Div));
+              for (unsigned k = 1; k < AM->getNumOperands(); ++k)
+                RestOps.push_back(AM->getOperand(k));
+              const SCEV *AReduced =
+                  RestOps.size() == 1 ? RestOps[0] : SE.getMulExpr(RestOps);
+              Candidates.push_back(BuildExpected(AReduced, C / Div));
+            }
+          }
+        }
+      }
+
+      const SCEV *Match = nullptr;
+      unsigned MatchJ = 0;
+      for (unsigned j = 0; j < Expr->getNumOperands() && !Match; ++j) {
+        if (i == j) continue;
+        for (const SCEV *Cand : Candidates) {
+          if (Expr->getOperand(j) == Cand) {
+            Match = Cand;
+            MatchJ = j;
+            break;
+          }
+        }
+      }
+      if (Match) {
+        unsigned j = MatchJ;
+        // Match!  Rebuild the AddExpr with the udiv operand and the rem
+        // operand replaced by the equivalent linear form K2 * A.
+        SmallVector<const SCEV *, 4> NewOps;
+        for (unsigned k = 0; k < Expr->getNumOperands(); ++k)
+          if (k != i && k != j)
+            NewOps.push_back(Expr->getOperand(k));
+        NewOps.push_back(
+            (K2 == 1) ? A : SE.getMulExpr(SE.getConstant(A->getType(), K2), A));
+        return visit(SE.getAddExpr(NewOps));
+      }
+    }
+
+    // ----- No fold applied: fall back to per-operand visitation -----
     DimStrides Total;
     for (const SCEV *Op : Expr->operands()) {
       DimStrides OpStride = visit(Op);

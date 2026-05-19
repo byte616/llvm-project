@@ -38,5 +38,35 @@
     "Stub": "test_flat_iv_no_loop",
     "BlockDim": {"X": 32, "Y": 1, "Z": 1},
     "GridDim": {"X": 1, "Y": 1, "Z": 1}
+  },
+  {
+    "Stub": "test_divrem_fold",
+    "BlockDim": {"X": 32, "Y": 1, "Z": 1},
+    "GridDim": {"X": 1, "Y": 1, "Z": 1}
+  },
+  {
+    "Stub": "test_divrem_fold_s24",
+    "BlockDim": {"X": 32, "Y": 1, "Z": 1},
+    "GridDim": {"X": 1, "Y": 1, "Z": 1}
+  },
+  {
+    "Stub": "test_divrem_fold_s3_odd",
+    "BlockDim": {"X": 32, "Y": 1, "Z": 1},
+    "GridDim": {"X": 1, "Y": 1, "Z": 1}
+  },
+  {
+    "Stub": "test_divrem_fold_inner16",
+    "BlockDim": {"X": 32, "Y": 1, "Z": 1},
+    "GridDim": {"X": 1, "Y": 1, "Z": 1}
+  },
+  {
+    "Stub": "test_divrem_fold_s6",
+    "BlockDim": {"X": 32, "Y": 1, "Z": 1},
+    "GridDim": {"X": 1, "Y": 1, "Z": 1}
+  },
+  {
+    "Stub": "test_divrem_fold_mask30",
+    "BlockDim": {"X": 32, "Y": 1, "Z": 1},
+    "GridDim": {"X": 1, "Y": 1, "Z": 1}
   }
 ]
