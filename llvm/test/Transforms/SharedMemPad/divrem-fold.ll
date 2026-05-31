@@ -18,7 +18,10 @@ target triple = "nvptx64-nvidia-cuda"
 
 ; CHECK: [Padding] Candidate L=32 N=1 (units=4B)
 ; CHECK: [Padding] >>> Recommended pad period: L=32 N=1
-; CHECK: @arr.padded = internal addrspace(3) global [{{[0-9]+}} x float]
+; D1 == L (=32), so the 2-D dim-expand fast path applies and produces
+; [32 x [33 x float]] instead of a flat 1-D padded array.
+; CHECK: [Transform] Dim-expanded (2D fast path): arr.padded [32 x [32+1 x T]]
+; CHECK: @arr.padded = internal addrspace(3) global [32 x [33 x float]]
 
 define void @test_divrem_fold(ptr %out) {
 entry:
