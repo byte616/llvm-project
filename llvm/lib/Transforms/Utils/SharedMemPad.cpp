@@ -45,6 +45,23 @@ static cl::opt<std::string> BlockDimFile(
              "running 'opt -passes=cuda-blockdim-extract' on host IR)"),
     cl::value_desc("filename"), cl::init(""));
 
+// Strategy used when the global is a 2-D array `[D0 x [D1 x T]]` and the
+// chosen padding period L equals the innermost dimension D1.
+//   * "closed-form" (default): keep a 1-D padded layout
+//                              `[D0*(D1+N) x T]` and rewrite each GEP to
+//                              compute `padded = (D1+N)*r + c` directly.
+//   * "dim-expand"           : declare the new global as
+//                              `[D0 x [D1+N x T]]` and let GEP indexing
+//                              handle the multiplication.
+//   * "flatten"              : fall through to the general flatten + pad
+//                              rewrite (`flat + N*(flat/L)`).
+// Cases that do not satisfy the 2-D + D1==L precondition always use the
+// flatten path regardless of this flag.
+static cl::opt<std::string> Pad2DMode(
+    "shared-mem-pad-2d-mode",
+    cl::desc("2D-with-D1==L fast-path strategy: closed-form|dim-expand|flatten"),
+    cl::init("closed-form"));
+
 // target machine: NV GPU
 // 1. Calculate the access stride of shared memory between all the threads in
 // the single warp
@@ -446,6 +463,297 @@ static SmallVector<int64_t, 4> computeDimStrides(Type *SrcTy) {
   return Strides;
 }
 
+static bool evalTidConstantExpr(Value *V, Value *TidX, Value *TidY, Value *TidZ,
+                                int64_t LaneX, int64_t &Out,
+                                SmallPtrSetImpl<Value *> &Visiting) {
+  if (auto *CI = dyn_cast<ConstantInt>(V)) {
+    Out = CI->getSExtValue();
+    return true;
+  }
+
+  if (V == TidX) {
+    Out = LaneX;
+    return true;
+  }
+  if (V == TidY || V == TidZ) {
+    Out = 0;
+    return true;
+  }
+
+  auto EvalOperand = [&](Value *Op, int64_t &Result) {
+    return evalTidConstantExpr(Op, TidX, TidY, TidZ, LaneX, Result, Visiting);
+  };
+
+  if (!Visiting.insert(V).second)
+    return false;
+
+  auto Finish = [&](bool Ok) {
+    Visiting.erase(V);
+    return Ok;
+  };
+
+  if (auto *CI = dyn_cast<CastInst>(V)) {
+    int64_t X = 0;
+    if (!EvalOperand(CI->getOperand(0), X))
+      return Finish(false);
+    unsigned SrcBits = CI->getOperand(0)->getType()->getIntegerBitWidth();
+    unsigned DstBits = CI->getType()->getIntegerBitWidth();
+    APInt A(std::max<unsigned>(SrcBits, 1), (uint64_t)X);
+    switch (CI->getOpcode()) {
+    case Instruction::Trunc:
+      Out = A.trunc(DstBits).getSExtValue();
+      return Finish(true);
+    case Instruction::ZExt:
+      Out = A.zext(DstBits).getZExtValue();
+      return Finish(true);
+    case Instruction::SExt:
+      Out = A.sext(DstBits).getSExtValue();
+      return Finish(true);
+    default:
+      return Finish(false);
+    }
+  }
+
+  if (auto *BO = dyn_cast<BinaryOperator>(V)) {
+    int64_t L = 0, R = 0;
+    if (!EvalOperand(BO->getOperand(0), L) || !EvalOperand(BO->getOperand(1), R))
+      return Finish(false);
+    switch (BO->getOpcode()) {
+    case Instruction::Add:
+      Out = L + R;
+      return Finish(true);
+    case Instruction::Sub:
+      Out = L - R;
+      return Finish(true);
+    case Instruction::Mul:
+      Out = L * R;
+      return Finish(true);
+    case Instruction::Shl:
+      if (R < 0 || R >= 63)
+        return Finish(false);
+      Out = L << R;
+      return Finish(true);
+    case Instruction::LShr:
+      if (R < 0 || R >= 63)
+        return Finish(false);
+      Out = (uint64_t)L >> R;
+      return Finish(true);
+    case Instruction::AShr:
+      if (R < 0 || R >= 63)
+        return Finish(false);
+      Out = L >> R;
+      return Finish(true);
+    case Instruction::And:
+      Out = L & R;
+      return Finish(true);
+    case Instruction::Or:
+      Out = L | R;
+      return Finish(true);
+    case Instruction::Xor:
+      Out = L ^ R;
+      return Finish(true);
+    case Instruction::UDiv:
+      if (R == 0)
+        return Finish(false);
+      Out = (uint64_t)L / (uint64_t)R;
+      return Finish(true);
+    case Instruction::SDiv:
+      if (R == 0)
+        return Finish(false);
+      Out = L / R;
+      return Finish(true);
+    case Instruction::URem:
+      if (R == 0)
+        return Finish(false);
+      Out = (uint64_t)L % (uint64_t)R;
+      return Finish(true);
+    case Instruction::SRem:
+      if (R == 0)
+        return Finish(false);
+      Out = L % R;
+      return Finish(true);
+    default:
+      return Finish(false);
+    }
+  }
+
+  if (auto *Cmp = dyn_cast<ICmpInst>(V)) {
+    int64_t L = 0, R = 0;
+    if (!EvalOperand(Cmp->getOperand(0), L) || !EvalOperand(Cmp->getOperand(1), R))
+      return Finish(false);
+    switch (Cmp->getPredicate()) {
+    case CmpInst::ICMP_EQ:
+      Out = L == R;
+      return Finish(true);
+    case CmpInst::ICMP_NE:
+      Out = L != R;
+      return Finish(true);
+    case CmpInst::ICMP_SLT:
+      Out = L < R;
+      return Finish(true);
+    case CmpInst::ICMP_SLE:
+      Out = L <= R;
+      return Finish(true);
+    case CmpInst::ICMP_SGT:
+      Out = L > R;
+      return Finish(true);
+    case CmpInst::ICMP_SGE:
+      Out = L >= R;
+      return Finish(true);
+    case CmpInst::ICMP_ULT:
+      Out = (uint64_t)L < (uint64_t)R;
+      return Finish(true);
+    case CmpInst::ICMP_ULE:
+      Out = (uint64_t)L <= (uint64_t)R;
+      return Finish(true);
+    case CmpInst::ICMP_UGT:
+      Out = (uint64_t)L > (uint64_t)R;
+      return Finish(true);
+    case CmpInst::ICMP_UGE:
+      Out = (uint64_t)L >= (uint64_t)R;
+      return Finish(true);
+    default:
+      return Finish(false);
+    }
+  }
+
+  if (auto *Sel = dyn_cast<SelectInst>(V)) {
+    int64_t Cond = 0;
+    if (!EvalOperand(Sel->getCondition(), Cond))
+      return Finish(false);
+    return Finish(EvalOperand(Sel->getOperand(Cond ? 1 : 2), Out));
+  }
+
+  return Finish(false);
+}
+
+static bool inferLinearTidXStrideFrom2DGEP(Value *PtrOp, Value *TidX,
+                                           Value *TidY, Value *TidZ,
+                                           unsigned ElementSizeBytes,
+                                           DimStrides &S) {
+  auto *GEP = dyn_cast<GEPOperator>(PtrOp);
+  if (!GEP || GEP->getNumIndices() != 3)
+    return false;
+
+  auto *OuterAT = dyn_cast<ArrayType>(GEP->getSourceElementType());
+  if (!OuterAT)
+    return false;
+  auto *InnerAT = dyn_cast<ArrayType>(OuterAT->getElementType());
+  if (!InnerAT || isa<ArrayType>(InnerAT->getElementType()))
+    return false;
+
+  auto *Leading = dyn_cast<ConstantInt>(GEP->getOperand(1));
+  if (!Leading || !Leading->isZero())
+    return false;
+
+  int64_t D1 = InnerAT->getNumElements();
+  SmallVector<int64_t, 32> FlatIdx;
+  for (int64_t Lane = 0; Lane < 32; ++Lane) {
+    int64_t Row = 0, Col = 0;
+    SmallPtrSet<Value *, 16> Visiting;
+    if (!evalTidConstantExpr(GEP->getOperand(2), TidX, TidY, TidZ, Lane, Row,
+                             Visiting))
+      return false;
+    Visiting.clear();
+    if (!evalTidConstantExpr(GEP->getOperand(3), TidX, TidY, TidZ, Lane, Col,
+                             Visiting))
+      return false;
+    FlatIdx.push_back(Row * D1 + Col);
+  }
+
+  int64_t Delta = FlatIdx[1] - FlatIdx[0];
+  for (int64_t Lane = 0; Lane < 32; ++Lane)
+    if (FlatIdx[Lane] != FlatIdx[0] + Lane * Delta)
+      return false;
+
+  S = {Delta * (int64_t)ElementSizeBytes, 0, 0, false};
+  return true;
+}
+
+// Collected user lists for the 2-D fast paths (dim-expand / closed-form).
+// Indices into the *original* shape are recovered later from each user.
+struct Collected2DUsers {
+  SmallVector<GetElementPtrInst *, 32> GEPs;
+  SmallVector<ConstantExpr *, 16> CEGEPs;
+  SmallVector<Instruction *, 8> DirectAccesses;
+};
+
+// Walk the user graph of a 2-D shared-memory global rooted at `GV`.
+//
+// Accept only users we know how to rewrite trivially without re-deriving
+// (row, col) from a SCEV: element-form 2-D GEPs against `OuterAT`,
+// constant byte-offset GEPs, pass-through casts, and base-pointer
+// load/store reachable without going through any GEP.
+//
+// Returns true on success (Out is populated); false means at least one
+// user has an unsupported shape and the caller should fall back.
+static bool collect2DUsersForFastPath(GlobalVariable *GV, ArrayType *OuterAT,
+                                      Collected2DUsers &Out) {
+  auto *InnerAT = cast<ArrayType>(OuterAT->getElementType());
+  SmallPtrSet<Value *, 16> Visited;
+  std::function<bool(Value *, bool)> Walk = [&](Value *V,
+                                                bool ThroughGEP) -> bool {
+    if (!Visited.insert(V).second)
+      return true;
+    for (User *U : V->users()) {
+      if (auto *GEP = dyn_cast<GetElementPtrInst>(U)) {
+        Type *SrcTy = GEP->getSourceElementType();
+        if (SrcTy == OuterAT && GEP->getNumIndices() == 3) {
+          // Element form `gep [D0x[D1xT]], p, 0, r, c`.
+        } else if (SrcTy == InnerAT && GEP->getNumIndices() == 2) {
+          // Row-zero form after pointer decay: `gep [D1xT], p, 0, c`.
+        } else if (SrcTy->isIntegerTy(8) && GEP->getNumIndices() == 1 &&
+                   isa<ConstantInt>(GEP->getOperand(1))) {
+          // Constant byte-offset form: decode to (r, c) later.
+        } else {
+          return false;
+        }
+        Out.GEPs.push_back(GEP);
+      } else if (auto *CE = dyn_cast<ConstantExpr>(U)) {
+        if (CE->getOpcode() == Instruction::GetElementPtr) {
+          auto *GEPOp = cast<GEPOperator>(CE);
+          Type *SrcTy = GEPOp->getSourceElementType();
+          if (SrcTy == OuterAT && CE->getNumOperands() == 4) {
+            // CE element form: [ptr, 0, r, c].
+          } else if (SrcTy == InnerAT && CE->getNumOperands() == 3) {
+            // CE row-zero form: [ptr, 0, c].
+          } else if (SrcTy->isIntegerTy(8) && CE->getNumOperands() == 2 &&
+                     isa<ConstantInt>(CE->getOperand(1))) {
+            // CE byte-offset form.
+          } else {
+            return false;
+          }
+          Out.CEGEPs.push_back(CE);
+          if (!Walk(CE, /*ThroughGEP=*/true))
+            return false;
+        } else if (CE->getOpcode() == Instruction::AddrSpaceCast ||
+                   CE->getOpcode() == Instruction::BitCast) {
+          if (!Walk(CE, ThroughGEP))
+            return false;
+        } else {
+          return false;
+        }
+      } else if (isa<AddrSpaceCastInst>(U) || isa<BitCastInst>(U)) {
+        if (!Walk(U, ThroughGEP))
+          return false;
+      } else if (auto *LI = dyn_cast<LoadInst>(U)) {
+        if (!ThroughGEP)
+          Out.DirectAccesses.push_back(LI);
+      } else if (auto *SI = dyn_cast<StoreInst>(U)) {
+        if (SI->getPointerOperand() == V) {
+          if (!ThroughGEP)
+            Out.DirectAccesses.push_back(SI);
+        }
+        // Stored-value (escape): ignore -- matches flatten path's behavior.
+      } else {
+        return false; // PHI, Select, Call, etc.
+      }
+    }
+    return true;
+  };
+  return Walk(GV, /*ThroughGEP=*/false);
+}
+
 // Fast path for the common 2-D case where L equals the innermost dim size.
 //
 // Original layout: GV  = [D0 x [D1 x ElemTy]]  with D1 == L
@@ -489,74 +797,14 @@ static bool tryApply2DDimExpand(GlobalVariable *GV, int64_t L, int64_t N) {
   const DataLayout &DL = M->getDataLayout();
   uint64_t ElemSize = DL.getTypeAllocSize(ElemTy);
 
-  // 2. Walk users.  Bail out (return false) if anything is not a shape
-  //    we can rewrite trivially -- the caller will fall back to the
-  //    general flatten path.
-  SmallVector<GetElementPtrInst *, 32> GEPsToReplace;
-  SmallVector<ConstantExpr *, 16> CEGEPsToReplace;
-  SmallVector<Instruction *, 8> DirectAccessesToReplace;
-  SmallPtrSet<Value *, 16> Visited;
-
-  std::function<bool(Value *, bool)> Walk = [&](Value *V,
-                                                bool ThroughGEP) -> bool {
-    if (!Visited.insert(V).second)
-      return true;
-    for (User *U : V->users()) {
-      if (auto *GEP = dyn_cast<GetElementPtrInst>(U)) {
-        Type *SrcTy = GEP->getSourceElementType();
-        if (SrcTy == OuterAT && GEP->getNumIndices() == 3) {
-          // Element form `gep [D0x[D1xT]], p, 0, r, c`: handled.
-        } else if (SrcTy->isIntegerTy(8) && GEP->getNumIndices() == 1 &&
-                   isa<ConstantInt>(GEP->getOperand(1))) {
-          // Constant byte-offset form: handled (decode to (r, c)).
-        } else {
-          return false;
-        }
-        GEPsToReplace.push_back(GEP);
-      } else if (auto *CE = dyn_cast<ConstantExpr>(U)) {
-        if (CE->getOpcode() == Instruction::GetElementPtr) {
-          auto *GEPOp = cast<GEPOperator>(CE);
-          Type *SrcTy = GEPOp->getSourceElementType();
-          if (SrcTy == OuterAT && CE->getNumOperands() == 4) {
-            // CE element form: [ptr, 0, r, c].
-          } else if (SrcTy->isIntegerTy(8) && CE->getNumOperands() == 2 &&
-                     isa<ConstantInt>(CE->getOperand(1))) {
-            // CE byte-offset form.
-          } else {
-            return false;
-          }
-          CEGEPsToReplace.push_back(CE);
-          if (!Walk(CE, /*ThroughGEP=*/true))
-            return false;
-        } else if (CE->getOpcode() == Instruction::AddrSpaceCast ||
-                   CE->getOpcode() == Instruction::BitCast) {
-          if (!Walk(CE, ThroughGEP))
-            return false;
-        } else {
-          return false;
-        }
-      } else if (isa<AddrSpaceCastInst>(U) || isa<BitCastInst>(U)) {
-        if (!Walk(U, ThroughGEP))
-          return false;
-      } else if (auto *LI = dyn_cast<LoadInst>(U)) {
-        if (!ThroughGEP)
-          DirectAccessesToReplace.push_back(LI);
-      } else if (auto *SI = dyn_cast<StoreInst>(U)) {
-        if (SI->getPointerOperand() == V) {
-          if (!ThroughGEP)
-            DirectAccessesToReplace.push_back(SI);
-        }
-        // V is the stored value (escape): leave existing reference --
-        // matches the flatten path's behavior.
-      } else {
-        return false; // PHI, Select, Call, etc.
-      }
-    }
-    return true;
-  };
-
-  if (!Walk(GV, /*ThroughGEP=*/false))
+  // 2. Walk users.  Bail out if anything is not a shape we can rewrite
+  //    trivially -- the caller will fall back to the general flatten path.
+  Collected2DUsers Users;
+  if (!collect2DUsersForFastPath(GV, OuterAT, Users))
     return false;
+  auto &GEPsToReplace = Users.GEPs;
+  auto &CEGEPsToReplace = Users.CEGEPs;
+  auto &DirectAccessesToReplace = Users.DirectAccesses;
 
   // 3. Build the dim-expanded global.
   ArrayType *NewInnerAT = ArrayType::get(ElemTy, D1 + N);
@@ -595,6 +843,11 @@ static bool tryApply2DDimExpand(GlobalVariable *GV, int64_t L, int64_t N) {
                        GEP->getOperand(3)};
       NewGEP = B.CreateGEP(NewTy, NewPtr, Idxs, GEP->getName() + ".padded",
                            GEP->isInBounds());
+    } else if (SrcTy == InnerAT) {
+      Value *Idxs[] = {GEP->getOperand(1), ConstantInt::get(I64Ty, 0),
+                       GEP->getOperand(2)};
+      NewGEP = B.CreateGEP(NewTy, NewPtr, Idxs, GEP->getName() + ".padded",
+                           GEP->isInBounds());
     } else {
       int64_t ByteOff = cast<ConstantInt>(GEP->getOperand(1))->getSExtValue();
       int64_t Row, Col;
@@ -620,6 +873,12 @@ static bool tryApply2DDimExpand(GlobalVariable *GV, int64_t L, int64_t N) {
       Constant *Idxs[] = {cast<Constant>(CE->getOperand(1)),
                           cast<Constant>(CE->getOperand(2)),
                           cast<Constant>(CE->getOperand(3))};
+      NewCE = ConstantExpr::getGetElementPtr(NewTy, NewPtr, Idxs,
+                                             /*InBounds=*/true);
+    } else if (SrcTy == InnerAT) {
+      Constant *Idxs[] = {cast<Constant>(CE->getOperand(1)),
+                          ConstantInt::get(I64Ty, 0),
+                          cast<Constant>(CE->getOperand(2))};
       NewCE = ConstantExpr::getGetElementPtr(NewTy, NewPtr, Idxs,
                                              /*InBounds=*/true);
     } else {
@@ -665,6 +924,170 @@ static bool tryApply2DDimExpand(GlobalVariable *GV, int64_t L, int64_t N) {
   return true;
 }
 
+// Closed-form fast path for the 2-D case where L equals the innermost dim.
+//
+// Original layout: GV  = [D0 x [D1 x ElemTy]]  with D1 == L
+// New layout:      GV' = [D0*(D1+N) x ElemTy]  (1-D, same total size as
+//                                               the flatten path)
+//
+// Each "gep [D0 x [D1 x T]], p, 0, r, c" is rewritten to a 1-D GEP with
+//   padded = (D1+N)*r + c
+// emitted directly -- skipping the flatten path's `flat = D1*r + c` plus
+// `padded = flat + N*(flat/L)` chain.  Mathematically identical because
+// col < L = D1 makes flat/L exactly equal to r, but produces strictly
+// fewer instructions per access (one mul + one add).
+//
+// Same precondition set as the dim-expand fast path; falls back when
+// any user is not a shape we can rewrite without re-deriving (r, c).
+static bool tryApply2DClosedFormPad(GlobalVariable *GV, int64_t L, int64_t N) {
+  Module *M = GV->getParent();
+  LLVMContext &Ctx = M->getContext();
+  Type *I64Ty = Type::getInt64Ty(Ctx);
+
+  // 1. Shape check.
+  auto *OuterAT = dyn_cast<ArrayType>(GV->getValueType());
+  if (!OuterAT)
+    return false;
+  auto *InnerAT = dyn_cast<ArrayType>(OuterAT->getElementType());
+  if (!InnerAT)
+    return false;
+  if (isa<ArrayType>(InnerAT->getElementType()))
+    return false;
+  Type *ElemTy = InnerAT->getElementType();
+  int64_t D0 = OuterAT->getNumElements();
+  int64_t D1 = InnerAT->getNumElements();
+  if (D1 != L)
+    return false;
+
+  const DataLayout &DL = M->getDataLayout();
+  uint64_t ElemSize = DL.getTypeAllocSize(ElemTy);
+  int64_t Stride = D1 + N;          // padded row pitch in elements
+  int64_t PaddedSize = D0 * Stride; // == FlatSize + N * (FlatSize / L)
+
+  // 2. Walk users.
+  Collected2DUsers Users;
+  if (!collect2DUsersForFastPath(GV, OuterAT, Users))
+    return false;
+
+  // 3. Build the 1-D padded global.
+  ArrayType *NewTy = ArrayType::get(ElemTy, PaddedSize);
+  auto *NewGV =
+      new GlobalVariable(*M, NewTy, /*isConstant=*/false, GV->getLinkage(),
+                         UndefValue::get(NewTy), GV->getName() + ".padded",
+                         /*InsertBefore=*/nullptr, GV->getThreadLocalMode(),
+                         GV->getAddressSpace());
+  NewGV->setAlignment(GV->getAlign());
+  NewGV->setUnnamedAddr(GV->getUnnamedAddr());
+
+  auto MakeNewPtr = [&](unsigned PtrAS) -> Constant * {
+    if (NewGV->getAddressSpace() == PtrAS)
+      return NewGV;
+    return ConstantExpr::getAddrSpaceCast(NewGV, PointerType::get(Ctx, PtrAS));
+  };
+
+  // Helper: zero/sign-extend an index value to i64, folding constants.
+  auto ExtendToI64 = [&](Value *V, IRBuilder<> &B) -> Value * {
+    if (V->getType() == I64Ty)
+      return V;
+    if (auto *CI = dyn_cast<ConstantInt>(V))
+      return ConstantInt::get(I64Ty, CI->getSExtValue());
+    return B.CreateSExt(V, I64Ty, "idx.ext");
+  };
+
+  // Decode a constant byte offset into (row, col) on the original layout.
+  auto DecodeByteOff = [&](int64_t ByteOff, int64_t &Row, int64_t &Col) {
+    int64_t ElemIdx = ByteOff / (int64_t)ElemSize;
+    Row = ElemIdx / D1;
+    Col = ElemIdx % D1;
+  };
+
+  // 4a. Rewrite GEP instructions: emit padded = Stride*row + col.
+  for (auto *GEP : Users.GEPs) {
+    IRBuilder<> B(GEP);
+    Type *SrcTy = GEP->getSourceElementType();
+    unsigned PtrAS =
+        GEP->getPointerOperand()->getType()->getPointerAddressSpace();
+    Value *NewPtr = MakeNewPtr(PtrAS);
+    Value *PaddedIdx;
+    if (SrcTy == OuterAT) {
+      Value *Row = ExtendToI64(GEP->getOperand(2), B);
+      Value *Col = ExtendToI64(GEP->getOperand(3), B);
+      Value *RowScaled;
+      if (isPowerOf2_64(Stride))
+        RowScaled = B.CreateShl(
+            Row, ConstantInt::get(I64Ty, Log2_64(Stride)), "row.scaled");
+      else
+        RowScaled =
+            B.CreateMul(Row, ConstantInt::get(I64Ty, Stride), "row.scaled");
+      PaddedIdx = B.CreateAdd(RowScaled, Col, "padded");
+    } else if (SrcTy == InnerAT) {
+      PaddedIdx = ExtendToI64(GEP->getOperand(2), B);
+    } else {
+      // Constant byte-offset form -- fold to a constant padded index.
+      int64_t ByteOff = cast<ConstantInt>(GEP->getOperand(1))->getSExtValue();
+      int64_t Row, Col;
+      DecodeByteOff(ByteOff, Row, Col);
+      PaddedIdx = ConstantInt::get(I64Ty, Stride * Row + Col);
+    }
+    Value *Idxs[] = {ConstantInt::get(I64Ty, 0), PaddedIdx};
+    Value *NewGEP = B.CreateGEP(NewTy, NewPtr, Idxs, GEP->getName() + ".padded",
+                                GEP->isInBounds());
+    GEP->replaceAllUsesWith(NewGEP);
+    GEP->eraseFromParent();
+  }
+
+  // 4b. Rewrite CE GEPs (all indices constant -> constant padded index).
+  for (auto *CE : Users.CEGEPs) {
+    auto *GEPOp = cast<GEPOperator>(CE);
+    Type *SrcTy = GEPOp->getSourceElementType();
+    unsigned PtrAS = CE->getType()->getPointerAddressSpace();
+    Constant *NewPtr = MakeNewPtr(PtrAS);
+    int64_t Row, Col;
+    if (SrcTy == OuterAT) {
+      Row = cast<ConstantInt>(CE->getOperand(2))->getSExtValue();
+      Col = cast<ConstantInt>(CE->getOperand(3))->getSExtValue();
+    } else if (SrcTy == InnerAT) {
+      Row = 0;
+      Col = cast<ConstantInt>(CE->getOperand(2))->getSExtValue();
+    } else {
+      int64_t ByteOff = cast<ConstantInt>(CE->getOperand(1))->getSExtValue();
+      DecodeByteOff(ByteOff, Row, Col);
+    }
+    Constant *Idxs[] = {ConstantInt::get(I64Ty, 0),
+                        ConstantInt::get(I64Ty, Stride * Row + Col)};
+    Constant *NewCE = ConstantExpr::getGetElementPtr(NewTy, NewPtr, Idxs,
+                                                     /*InBounds=*/true);
+    CE->replaceAllUsesWith(NewCE);
+    CE->destroyConstant();
+  }
+
+  // 4c. Direct base-pointer load/store (flat 0 -> padded 0).
+  for (auto *Inst : Users.DirectAccesses) {
+    IRBuilder<> B(Inst);
+    Value *OldPtr = isa<LoadInst>(Inst)
+                        ? cast<LoadInst>(Inst)->getPointerOperand()
+                        : cast<StoreInst>(Inst)->getPointerOperand();
+    unsigned PtrAS = OldPtr->getType()->getPointerAddressSpace();
+    Value *NewPtr = MakeNewPtr(PtrAS);
+    Value *Idxs[] = {ConstantInt::get(I64Ty, 0), ConstantInt::get(I64Ty, 0)};
+    Value *NewGEP = B.CreateGEP(NewTy, NewPtr, Idxs, "base.padded");
+    if (auto *LI = dyn_cast<LoadInst>(Inst))
+      LI->setOperand(LI->getPointerOperandIndex(), NewGEP);
+    else
+      cast<StoreInst>(Inst)->setOperand(
+          cast<StoreInst>(Inst)->getPointerOperandIndex(), NewGEP);
+  }
+
+  errs() << "  [Transform] Closed-form padded (2D fast path): "
+         << NewGV->getName() << " [" << PaddedSize
+         << " x T] (stride=" << Stride << ", L=" << L << ", N=" << N << ")\n";
+
+  GV->removeDeadConstantUsers();
+  if (GV->use_empty())
+    GV->eraseFromParent();
+  return true;
+}
+
 // Replace a shared-memory GlobalVariable with a padded 1-D version.
 //
 // Original layout: GV  = [A x [B x float]]  (addrspace 3)
@@ -681,10 +1104,17 @@ static bool tryApply2DDimExpand(GlobalVariable *GV, int64_t L, int64_t N) {
 static void applyFlattenAndPad(GlobalVariable *GV, int64_t L, int64_t N,
                                LoopInfo *LI = nullptr,
                                ScalarEvolution *SE = nullptr) {
-  // Try the cheap 2-D dim-expand rewrite first; fall back to flatten+pad
-  // if the shape or user set is not amenable.
-  if (tryApply2DDimExpand(GV, L, N))
-    return;
+  // Try a 2-D fast path first (selected by `-shared-mem-pad-2d-mode`);
+  // fall back to flatten+pad if the shape/user set is not amenable, or if
+  // the flag explicitly requests "flatten".
+  if (Pad2DMode == "closed-form") {
+    if (tryApply2DClosedFormPad(GV, L, N))
+      return;
+  } else if (Pad2DMode == "dim-expand") {
+    if (tryApply2DDimExpand(GV, L, N))
+      return;
+  }
+  // "flatten" or unknown value -> skip fast paths.
 
   Module *M = GV->getParent();
   LLVMContext &Ctx = M->getContext();
@@ -1375,10 +1805,16 @@ PreservedAnalyses SharedMemPass::run(Function &F, FunctionAnalysisManager &AM) {
           // (float=1, float2/double=2, float4=4)
           ElemBanks = std::max(1u, ElementSizeBytes / 4u);
 
-          // Use SCEV to calculate the stride
-          const SCEV *Expr = SE.getSCEV(PtrOp);
-          StrideVisitor Visitor(SE, TidX, TidY, TidZ);
-          S = Visitor.visit(Expr);
+          // Use a per-lane 2-D GEP fallback first. Power-of-two row sizes let
+          // InstCombine lower row/col arithmetic into lshr/and/select patterns
+          // that SCEV may not fold back into `row * pitch + col`. If evaluating
+          // lanes 0..31 yields a linear flat index, use that exact Tx stride.
+          if (!inferLinearTidXStrideFrom2DGEP(PtrOp, TidX, TidY, TidZ,
+                                             ElementSizeBytes, S)) {
+            const SCEV *Expr = SE.getSCEV(PtrOp);
+            StrideVisitor Visitor(SE, TidX, TidY, TidZ);
+            S = Visitor.visit(Expr);
+          }
 
           if (S.IsUnknown) {
             Case = StrideCase::UNKNOWN_CASE;
@@ -1606,6 +2042,48 @@ PreservedAnalyses SharedMemPass::run(Function &F, FunctionAnalysisManager &AM) {
             if (Q > 0 && Q < LTT)
               Candidates.insert({LTT, Q, E.ElemBanks});
           }
+        }
+
+        // ---------------------------------------------------------------
+        // Extra L candidates for 4-byte (float) accesses.
+        //
+        // The per-stride derivation above only emits a single L per
+        // stride (lcm(|S|, 32)).  For small strides (<= 32) this misses
+        // alternative L values that the cost model might prefer, e.g.
+        // a stride-3 access gets L=96 but L=160 or L=480 could in some
+        // layouts score better once all entries are considered.
+        //
+        // We add a fixed set of L candidates that are valid for any
+        // 4-byte stride pattern: all multiples of 32 up to 480 that
+        // arise from lcm(S, 32) for small odd strides.  Each is paired
+        // with the same PadN used by the per-stride candidates, and
+        // tagged with EB=1.
+        //
+        // Safety:
+        //   * L is always a multiple of 32, so L_bytes = L*4 is aligned
+        //     to any wider access size (up to 128B / float4).
+        //   * N is PadN, identical to other EB=1 candidates -- the
+        //     alignment filter below applies uniformly.
+        //   * Adding extra candidates cannot worsen the chosen result:
+        //     the cost model picks the highest-scoring candidate, so
+        //     these only help if they actually reduce conflicts.
+        //
+        // Gating: only added when at least one conflicting float access
+        // exists (otherwise there is nothing to pad for at EB=1).
+        // ---------------------------------------------------------------
+        bool HasFloatConflict = false;
+        for (auto &E : Entries) {
+          if (E.ElemBanks == 1 && std::abs(E.Stride) > 0 &&
+              E.ConflictBefore > 1) {
+            HasFloatConflict = true;
+            break;
+          }
+        }
+        if (HasFloatConflict) {
+          static const int64_t ExtraLs[] = {32,  96,  160, 224,
+                                            352, 416, 480};
+          for (int64_t L : ExtraLs)
+            Candidates.insert({L, PadN, /*ElemBanks=*/1u});
         }
 
         // Alignment filter: when the same shared variable is accessed by

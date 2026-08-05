@@ -1,6 +1,6 @@
-; RUN: opt -passes=shared-mem-pad -cuda-blockdim-file=%S/Inputs/blockdim.json -S < %s 2>&1 | FileCheck %s
+; RUN: opt -passes=shared-mem-pad -shared-mem-pad-2d-mode=dim-expand -cuda-blockdim-file=%S/Inputs/blockdim.json -S < %s 2>&1 | FileCheck %s
 
-; Verify the 2-D dim-expand fast path.
+; Verify the 2-D dim-expand fast path (selected via -shared-mem-pad-2d-mode).
 ;
 ; Shape is [32 x [32 x float]] with stride 2 -> bank conflict, picks L=32, N=1.
 ; Because D1 (= 32) equals L, the pass should bypass the flatten+pad rewrite

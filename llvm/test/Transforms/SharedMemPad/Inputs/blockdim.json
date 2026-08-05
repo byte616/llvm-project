@@ -73,5 +73,10 @@
     "Stub": "test_dim_expand_2d",
     "BlockDim": {"X": 32, "Y": 1, "Z": 1},
     "GridDim": {"X": 1, "Y": 1, "Z": 1}
+  },
+  {
+    "Stub": "test_closed_form_2d",
+    "BlockDim": {"X": 32, "Y": 1, "Z": 1},
+    "GridDim": {"X": 1, "Y": 1, "Z": 1}
   }
 ]
